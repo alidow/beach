@@ -41,6 +41,13 @@ elif [[ "${PRIVATE_BEACH_MANAGER_URL}" == "http://beach-manager:8080" ]]; then
   export PRIVATE_BEACH_MANAGER_URL="$MANAGER_URL_DEFAULT"
 fi
 
+# Allow dev/bypass tokens if provided; fall back to forged/host token.
+if [[ -n "${DEV_MANAGER_INSECURE_TOKEN:-}" ]]; then
+  export PB_MANAGER_TOKEN="${PB_MANAGER_TOKEN:-$DEV_MANAGER_INSECURE_TOKEN}"
+  export PB_MCP_TOKEN="${PB_MCP_TOKEN:-$DEV_MANAGER_INSECURE_TOKEN}"
+  export PB_CONTROLLER_TOKEN="${PB_CONTROLLER_TOKEN:-$DEV_MANAGER_INSECURE_TOKEN}"
+fi
+
 SESSION_SERVER=${RUN_AGENT_SESSION_SERVER:-${PONG_SESSION_SERVER:-http://localhost:4132/}}
 
 export BEACH_AUTH_GATEWAY=${BEACH_AUTH_GATEWAY:-"http://localhost:4133"}
@@ -117,14 +124,12 @@ refresh_cli_token() {
 }
 
 USER_SUPPLIED_MANAGER_TOKEN=false
-if [[ -z "${PB_MANAGER_TOKEN:-}" ]]; then
-  if ! PB_MANAGER_TOKEN=$(obtain_cli_token); then
-    exit 1
-  fi
-  export PB_MANAGER_TOKEN
-else
+if [[ -n "${PB_MANAGER_TOKEN:-}" ]]; then
   USER_SUPPLIED_MANAGER_TOKEN=true
   echo "[run-agent] using PB_MANAGER_TOKEN from environment" >&2
+else
+  echo "[run-agent] PB_MANAGER_TOKEN is required; set it before launching (no CLI fallback)" >&2
+  exit 1
 fi
 
 USER_SUPPLIED_MCP=false
@@ -169,46 +174,18 @@ sync_optional_tokens
 check_manager_access "$PB_MANAGER_TOKEN"
 STATUS="$CHECK_STATUS"
 if [[ "$STATUS" != "200" ]]; then
-  if [[ "$USER_SUPPLIED_MANAGER_TOKEN" == "true" ]]; then
-    echo "[run-agent] provided PB_MANAGER_TOKEN cannot access private beach '$PRIVATE_BEACH_ID' (HTTP $STATUS)." >&2
-    echo "[run-agent] attempting fresh beach login for profile '$BEACH_PROFILE'..." >&2
-    if ! PB_MANAGER_TOKEN=$(refresh_cli_token); then
-      echo "[run-agent] fallback login failed; please verify credentials or scopes." >&2
-      exit 1
-    fi
-    USER_SUPPLIED_MANAGER_TOKEN=false
-  else
-    echo "[run-agent] cached access token failed with HTTP $STATUS; refreshing beach login..." >&2
-    if ! PB_MANAGER_TOKEN=$(refresh_cli_token); then
-      exit 1
-    fi
+  echo "[run-agent] provided PB_MANAGER_TOKEN cannot access private beach '$PRIVATE_BEACH_ID' (HTTP $STATUS)." >&2
+  if [[ -n "$CHECK_BODY" ]]; then
+    echo "  • Response: $CHECK_BODY" >&2
   fi
-  export PB_MANAGER_TOKEN
-  sync_optional_tokens
-  check_manager_access "$PB_MANAGER_TOKEN"
-  STATUS="$CHECK_STATUS"
-  if [[ "$STATUS" != "200" ]]; then
-    for attempt in 1 2 3; do
-      sleep 1
-      check_manager_access "$PB_MANAGER_TOKEN"
-      STATUS="$CHECK_STATUS"
-      if [[ "$STATUS" == "200" ]]; then
-        break
-      fi
-    done
-  fi
-  if [[ "$STATUS" != "200" ]]; then
-    echo "[run-agent] token still cannot access private beach '$PRIVATE_BEACH_ID' after login (HTTP $STATUS)." >&2
-    if [[ -n "$CHECK_BODY" ]]; then
-      echo "  • Response: $CHECK_BODY" >&2
-    fi
-    echo "  • Token prefix: ${PB_MANAGER_TOKEN:0:32}..." >&2
-    echo "  • Profile: $BEACH_PROFILE" >&2
-    echo "  • Manager: $PRIVATE_BEACH_MANAGER_URL" >&2
-    echo "  • Ensure this account has pb:beaches.* / pb:sessions.* scopes for the beach." >&2
-    exit 1
-  fi
+  echo "  • Token prefix: ${PB_MANAGER_TOKEN:0:32}..." >&2
+  echo "  • Manager: $PRIVATE_BEACH_MANAGER_URL" >&2
+  echo "  • Ensure this account has pb:beaches.* / pb:sessions.* scopes for the beach." >&2
+  exit 1
 fi
+
+echo "[run-agent] env snapshot:" >&2
+env | grep -E '^(PB_|BEACH_|PRIVATE_BEACH_|RUN_AGENT_|PONG_)' >&2
 
 LOG_FILE="$LOG_DIR/beach-host-agent.log"
 BOOTSTRAP_FILE="$LOG_DIR/bootstrap-agent.json"
@@ -217,18 +194,32 @@ BOOTSTRAP_FILE="$LOG_DIR/bootstrap-agent.json"
 
 cd "$REPO_ROOT"
 
-cargo run --bin beach -- \
-  --log-level "$PONG_AGENT_LOG_LEVEL" \
-  --log-file "$LOG_FILE" \
-  --session-server "$SESSION_SERVER" \
-  host \
-  --bootstrap-output json \
-  --wait \
-  -- /usr/bin/env python3 "$REPO_ROOT/apps/private-beach/demo/pong/agent/main.py" \
-       --private-beach-id "$PRIVATE_BEACH_ID" \
-       --mcp-base-url "http://localhost:8080" \
-       --mcp-token "$PB_MCP_TOKEN" \
-       --default-controller-token "$PB_CONTROLLER_TOKEN" \
-       --log-level "$PONG_AGENT_STDOUT_LEVEL" \
-       --lease-reason "pong_showcase" \
-  | tee "$BOOTSTRAP_FILE"
+attempt=0
+while true; do
+  cargo run --bin beach -- \
+    --log-level "$PONG_AGENT_LOG_LEVEL" \
+    --log-file "$LOG_FILE" \
+    --session-server "$SESSION_SERVER" \
+    host \
+    --bootstrap-output json \
+    --wait \
+    -- /usr/bin/env python3 "$REPO_ROOT/apps/private-beach/demo/pong/agent/main.py" \
+         --private-beach-id "$PRIVATE_BEACH_ID" \
+         --mcp-base-url "http://localhost:8080" \
+         --mcp-token "$PB_MCP_TOKEN" \
+         --default-controller-token "$PB_CONTROLLER_TOKEN" \
+         --log-level "$PONG_AGENT_STDOUT_LEVEL" \
+         --lease-reason "pong_showcase" \
+    | tee "$BOOTSTRAP_FILE"
+  rc=${PIPESTATUS[0]}
+  if [[ $rc -eq 0 ]]; then
+    break
+  fi
+  attempt=$((attempt + 1))
+  if [[ $attempt -ge ${CARGO_RUN_RETRIES:-12} ]]; then
+    echo "[run-agent] cargo run failed after retries; giving up" >&2
+    exit $rc
+  fi
+  echo "[run-agent] cargo run failed (rc=$rc); retrying after ${CARGO_RUN_RETRY_DELAY:-5}s (attempt $attempt)..." >&2
+  sleep ${CARGO_RUN_RETRY_DELAY:-5}
+done

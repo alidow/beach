@@ -24,5 +24,10 @@ This directory houses the plans, specs, and design notes for the Private Beach p
 - Postgres is the durable store for both the Rust control plane (`apps/beach-manager`) and the Private Beach Surfer Next.js app; we do not persist product state in browser storage.
 - Drizzle ORM is the canonical TypeScript layer for querying and migrating Surfer-owned tables; generated artifacts stay in `apps/private-beach` while SQL migrations live alongside the manager.
 - Every UI workflow should prefer Beach Manager APIs for shared entities (beaches, sessions, memberships) and reach for Drizzle-backed tables only for Surfer-specific UX state that the manager does not yet expose.
+- Session server hostname: use a single base `BEACH_SESSION_SERVER_BASE` (dev
+  default `http://api.beach.dev:4132`) for signaling. Add `127.0.0.1 api.beach.dev`
+  to `/etc/hosts`; compose maps `api.beach.dev` to the host gateway. Other
+  vars (`BEACH_SESSION_SERVER`, `BEACH_ROAD_URL`, `BEACH_PUBLIC_SESSION_SERVER`,
+  Vite/Next URLs) derive from the base—avoid per-service hostnames.
 
 Questions or edits should be proposed via PR with reviewers from the Private Beach core working group.

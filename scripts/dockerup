@@ -4,13 +4,16 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
+HOSTS_PATH="/etc/hosts"
+HOSTS_ENTRY="127.0.0.1 api.beach.dev"
 
 usage() {
   cat <<'USAGE'
 Usage: dockerup [--enable-trace]
 
-Runs the full compose setup after loading .envrc via direnv. Run it through `direnv exec .` so the ICE envs actually load (e.g., `direnv exec . ./scripts/dockerup --enable-trace`).
-Pass --enable-trace to set BEACH_MANAGER_STDOUT_LOG/FILE_LOG/TRACE_DEPS=trace.
+Brings up beach-manager and beach-road, resolving the host's LAN IP on the host
+and passing it as BEACH_ICE_PUBLIC_IP/HOST (no direnv needed). Use --enable-trace
+to set BEACH_MANAGER_STDOUT_LOG/FILE_LOG/TRACE_DEPS=trace for the up step.
 USAGE
 }
 
@@ -34,14 +37,54 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-direnv allow >/dev/null 2>&1 || true
+# Ensure api.beach.dev resolves to localhost on the host so containers and
+# host-side clients share the same session-server hostname.
+if ! grep -qE '(^|[[:space:]])api\.beach\.dev([[:space:]]|$)' "$HOSTS_PATH"; then
+  echo "Missing hosts entry for api.beach.dev in $HOSTS_PATH."
+  if [[ -t 0 ]]; then
+    read -r -p "Add \"$HOSTS_ENTRY\" now (requires sudo)? [y/N] " reply
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      if sudo sh -c "echo '$HOSTS_ENTRY' >> '$HOSTS_PATH'"; then
+        echo "Added hosts entry: $HOSTS_ENTRY"
+      else
+        echo "Failed to add hosts entry; please add '$HOSTS_ENTRY' to $HOSTS_PATH and rerun." >&2
+        exit 1
+      fi
+    else
+      echo "Please add '$HOSTS_ENTRY' to $HOSTS_PATH and rerun." >&2
+      exit 1
+    fi
+  else
+    echo "Please add '$HOSTS_ENTRY' to $HOSTS_PATH and rerun dockerup." >&2
+    exit 1
+  fi
+fi
+
+# Resolve the host's active LAN IP (macOS) and use it as the ICE hint so the
+# browser can reach the host over the published UDP range.
+LAN_IP="$(ipconfig getifaddr "$(route get default | awk '/interface:/{print $2}')" )"
+# Use Static Bridge IP for Container Binding (Host<->Manager)
+# We use 172.28.0.100 as defined in docker-compose.yml
+export BEACH_ICE_PUBLIC_IP="$LAN_IP"
+export BEACH_ICE_PUBLIC_HOST="$LAN_IP"
+export BEACH_TURN_EXTERNAL_IP="$LAN_IP"
+
+# Configure Beach Gate to vend TURN credentials pointing to this IP
+export BEACH_GATE_TURN_URLS="turn:$LAN_IP:3478"
+export BEACH_GATE_TURN_SECRET="beach-dev-turn-secret"
+export BEACH_GATE_TURN_REALM="turn.private-beach.test"
+export BEACH_GATE_TURN_TTL="86400"
+
+echo "Using LAN IP for ICE: ${BEACH_ICE_PUBLIC_IP}"
+echo "Using TURN URL: ${BEACH_GATE_TURN_URLS}"
 
 ./scripts/dockerdown --postgres-only
 docker compose down
-docker compose build beach-manager
+docker compose build beach-manager beach-gate beach-road
 
 if [[ "$TRACE" == "true" ]]; then
-  sh -c 'BEACH_MANAGER_STDOUT_LOG=trace BEACH_MANAGER_FILE_LOG=trace BEACH_MANAGER_TRACE_DEPS=1 docker compose up -d'
+  BEACH_MANAGER_STDOUT_LOG=trace BEACH_MANAGER_FILE_LOG=trace BEACH_MANAGER_TRACE_DEPS=1 \
+    docker compose up -d
 else
   docker compose up -d
 fi

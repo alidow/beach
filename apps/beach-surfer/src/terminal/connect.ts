@@ -7,6 +7,7 @@ import { SignalingClient, generatePeerId } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 import type { ConnectionTrace } from '../lib/connectionTrace';
+import { maybeParseIceServers } from '../transport/webrtcIceConfig';
 
 export interface FallbackOverrides {
   cohort?: string;
@@ -20,6 +21,7 @@ export interface BrowserTransportConnection {
   remotePeerId?: string;
   secure?: SecureTransportSummary;
   fallbackOverrides?: FallbackOverrides;
+  iceServersExpiresAtMs?: number;
   close(): void;
 }
 
@@ -35,10 +37,30 @@ export interface ConnectBrowserTransportOptions {
   fallbackOverrides?: FallbackOverrides;
   trace?: ConnectionTrace | null;
   authorizationToken?: string;
+  onIceRefresh?: (context: IceRefreshContext) => void | boolean | Promise<void | boolean>;
 }
 
 const HOST_DOCKER_HOSTNAME = 'host.docker.internal';
 const sessionLocks = new Map<string, Promise<void>>();
+
+type IceRefreshReason = 'scheduled' | 'retry';
+
+type JoinMetadata = {
+  signalingUrl: string;
+  websocketUrl?: string;
+  role: 'offerer' | 'answerer';
+  pollIntervalMs: number;
+  iceServers?: RTCIceServer[];
+  iceServersExpiresAtMs?: number;
+  raw: JoinSessionResponse;
+};
+
+export type IceRefreshContext = {
+  join: JoinSessionResponse;
+  iceServers: RTCIceServer[];
+  expiresAtMs?: number;
+  reason: IceRefreshReason;
+};
 
 async function acquireSessionLock(sessionId: string): Promise<() => void> {
   const previous = sessionLocks.get(sessionId) ?? Promise.resolve();
@@ -76,8 +98,136 @@ export async function connectBrowserTransport(
   options: ConnectBrowserTransportOptions,
 ): Promise<BrowserTransportConnection> {
   const releaseLock = await acquireSessionLock(options.sessionId);
+  const trace = options.trace ?? null;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+  let signaling: SignalingClient | null = null;
+  let terminalTransport: DataChannelTerminalTransport | null = null;
+
+  const clearRefreshTimer = () => {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+  };
+
+  const closeConnection = (reason: string) => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    clearRefreshTimer();
+    try {
+      terminalTransport?.close();
+    } catch {
+      // ignore
+    }
+    try {
+      signaling?.close();
+    } catch {
+      // ignore
+    }
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.info('[connectBrowserTransport][rewrite] connection.closed', {
+        sessionId: options.sessionId,
+        reason,
+      });
+    }
+  };
+
+  const maybeHandleIceRefresh = async (
+    join: JoinMetadata,
+    iceServers: RTCIceServer[],
+    reason: IceRefreshReason,
+  ): Promise<boolean> => {
+    if (!options.onIceRefresh) {
+      return false;
+    }
+    try {
+      const result = await options.onIceRefresh({
+        join: join.raw,
+        iceServers,
+        expiresAtMs: join.iceServersExpiresAtMs,
+        reason,
+      });
+      return result === true;
+    } catch (error) {
+      trace?.mark('ice_refresh:callback_error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.error('[connectBrowserTransport][rewrite] iceRefresh.callback_error', {
+          sessionId: options.sessionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return false;
+    }
+  };
+
+  const scheduleIceRefresh = (expiresAtMs?: number) => {
+    if (closed) {
+      return;
+    }
+    const delay = computeIceRefreshDelay(expiresAtMs);
+    if (delay === null) {
+      return;
+    }
+    refreshTimer = setTimeout(() => {
+      void refreshIceServers('scheduled');
+    }, delay);
+  };
+
+  const scheduleRefreshRetry = () => {
+    if (closed) {
+      return;
+    }
+    refreshTimer = setTimeout(() => {
+      void refreshIceServers('retry');
+    }, 30_000);
+  };
+
+  const refreshIceServers = async (reason: IceRefreshReason) => {
+    if (closed) {
+      return;
+    }
+    clearRefreshTimer();
+    trace?.mark('ice_refresh:start', { sessionId: options.sessionId, reason });
+    try {
+      const refreshed = await fetchJoinMetadata(options);
+      const refreshedIce = selectIceServers(refreshed, options);
+      if (!refreshedIce || refreshedIce.length === 0) {
+        trace?.mark('ice_refresh:empty', { sessionId: options.sessionId });
+        scheduleRefreshRetry();
+        return;
+      }
+      const handled = await maybeHandleIceRefresh(refreshed, refreshedIce, reason);
+      if (!handled && !closed) {
+        closeConnection('ice_refresh');
+        return;
+      }
+      if (!closed) {
+        scheduleIceRefresh(refreshed.iceServersExpiresAtMs);
+      }
+    } catch (error) {
+      trace?.mark('ice_refresh:error', {
+        sessionId: options.sessionId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.warn('[connectBrowserTransport][rewrite] iceRefresh.error', {
+          sessionId: options.sessionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      scheduleRefreshRetry();
+    }
+  };
+
   try {
-    const trace = options.trace ?? null;
     trace?.mark('connect_browser_transport:start', {
       hasPasscode: Boolean(options.passcode),
       hasViewerToken: Boolean(options.viewerToken),
@@ -122,7 +272,7 @@ export async function connectBrowserTransport(
     const websocketUrl =
       normalizeConnectorUrl(join.websocketUrl) ?? attached.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
     trace?.mark('signaling:connect_start', { websocketUrl });
-    const signaling = await SignalingClient.connect({
+    signaling = await SignalingClient.connect({
       url: websocketUrl,
       peerId,
       passphrase: options.passcode,
@@ -142,13 +292,14 @@ export async function connectBrowserTransport(
     }
 
     let webrtcResult: Awaited<ReturnType<typeof connectWebRtcTransport>>;
+    const iceServers = selectIceServers(join, options);
     try {
       webrtcResult = await connectWebRtcTransport({
         signaling,
         signalingUrl: normalizedSignalingUrl,
         role: join.role,
         pollIntervalMs: join.pollIntervalMs,
-        iceServers: options.iceServers,
+        iceServers,
         logger: options.logger,
         passphrase: options.passcode,
         viewerToken: options.viewerToken ?? undefined,
@@ -190,6 +341,8 @@ export async function connectBrowserTransport(
       logger: options.logger,
       secureContext: secure,
     });
+    terminalTransport = transport;
+    scheduleIceRefresh(join.iceServersExpiresAtMs);
     if (options.fallbackOverrides && options.logger) {
       const { cohort, entitlementProof, telemetryOptIn } = options.fallbackOverrides;
       options.logger(
@@ -205,16 +358,8 @@ export async function connectBrowserTransport(
       remotePeerId,
       secure,
       fallbackOverrides: options.fallbackOverrides,
-      close: () => {
-        transport.close();
-        signaling.close();
-        if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-          // eslint-disable-next-line no-console
-          console.info('[connectBrowserTransport][rewrite] connection.closed', {
-            sessionId: options.sessionId,
-          });
-        }
-      },
+      iceServersExpiresAtMs: join.iceServersExpiresAtMs,
+      close: () => closeConnection('caller'),
     };
   } finally {
     releaseLock();
@@ -230,12 +375,68 @@ export function deriveWebsocketUrl(baseUrl: string, sessionId: string): string {
   return normalised.toString();
 }
 
-async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promise<{
-  signalingUrl: string;
-  websocketUrl?: string;
-  role: 'offerer' | 'answerer';
-  pollIntervalMs: number;
-}> {
+function computeIceRefreshDelay(expiresAtMs?: number): number | null {
+  if (typeof expiresAtMs !== 'number') {
+    return null;
+  }
+  const ttlMs = expiresAtMs - Date.now();
+  if (ttlMs <= 0) {
+    return null;
+  }
+  const delay = Math.floor(ttlMs * 0.8);
+  return delay > 0 ? delay : null;
+}
+
+function normalizeIceServers(raw?: unknown): RTCIceServer[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized = raw
+    .map((server) => {
+      if (!server || typeof server !== 'object') {
+        return null;
+      }
+      const urlsRaw = (server as any).urls;
+      const urls =
+        typeof urlsRaw === 'string'
+          ? urlsRaw.split(',').map((u) => u.trim()).filter(Boolean)
+          : Array.isArray(urlsRaw)
+            ? urlsRaw.map((u) => (typeof u === 'string' ? u.trim() : '')).filter(Boolean)
+            : [];
+      if (urls.length === 0) {
+        return null;
+      }
+      const candidate: RTCIceServer = { urls };
+      if (typeof (server as any).username === 'string' && (server as any).username.trim().length > 0) {
+        candidate.username = (server as any).username.trim();
+      }
+      if (
+        typeof (server as any).credential === 'string' &&
+        (server as any).credential.trim().length > 0
+      ) {
+        candidate.credential = (server as any).credential.trim();
+      }
+      return candidate;
+    })
+    .filter((server): server is RTCIceServer => Boolean(server));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function selectIceServers(
+  join: JoinMetadata,
+  options: ConnectBrowserTransportOptions,
+): RTCIceServer[] | undefined {
+  if (join.iceServers !== undefined) {
+    return join.iceServers;
+  }
+  if (options.iceServers !== undefined) {
+    return options.iceServers;
+  }
+  const envIceServers = maybeParseIceServers();
+  return envIceServers === null ? undefined : envIceServers;
+}
+
+async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promise<JoinMetadata> {
   const trace = options.trace ?? null;
   const url = `${options.baseUrl.replace(/\/$/, '')}/sessions/${options.sessionId}/join`;
   trace?.mark('join_metadata:request', { url });
@@ -319,12 +520,22 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
       : typeof offerMetadata.pollIntervalMs === 'number'
         ? offerMetadata.pollIntervalMs
         : 250;
+  const iceServers = normalizeIceServers(payload.ice_servers ?? payload.iceServers);
+  const iceServersExpiresAtMs =
+    typeof payload.ice_servers_expires_at_ms === 'number'
+      ? payload.ice_servers_expires_at_ms
+      : typeof (payload as any).iceServersExpiresAtMs === 'number'
+        ? (payload as any).iceServersExpiresAtMs
+        : undefined;
 
   return {
     signalingUrl,
     websocketUrl: payload.websocket_url ?? undefined,
     role,
     pollIntervalMs,
+    iceServers,
+    iceServersExpiresAtMs,
+    raw: payload,
   };
 }
 
@@ -355,4 +566,10 @@ interface JoinSessionResponse {
   webrtc_offer?: OfferMetadata;
   transports?: Array<{ kind: string; metadata?: OfferMetadata }>;
   websocket_url?: string;
+  // eslint-disable-next-line @typescript-eslint/naming-convention
+  ice_servers?: RTCIceServer[];
+  // eslint-disable-next-line @typescript-eslint/naming-convention
+  ice_servers_expires_at_ms?: number;
+  iceServers?: RTCIceServer[];
+  iceServersExpiresAtMs?: number;
 }

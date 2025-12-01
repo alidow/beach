@@ -56,9 +56,21 @@ impl FromRequestParts<AppState> for AuthToken {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_token(&parts.headers)
-            .or_else(|| extract_token_from_query(parts))
-            .ok_or(ApiError::Unauthorized)?;
+        use tracing::info;
+        info!("AuthToken::from_request_parts entering");
+        let token_opt = extract_token(&parts.headers).or_else(|| extract_token_from_query(parts));
+        info!("token_opt: {:?}", token_opt);
+
+        let token = match token_opt {
+            Some(t) => t,
+            None => {
+                if dev_insecure_enabled() || state.auth_context().bypass_enabled() {
+                    String::new()
+                } else {
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        };
 
         if dev_insecure_enabled() {
             if let Some(dev_token) = dev_bypass_token() {

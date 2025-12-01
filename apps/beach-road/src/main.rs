@@ -194,6 +194,10 @@ async fn main() {
             "/peer-sessions/:id/webrtc/answer",
             get(get_webrtc_answer).post(post_webrtc_answer),
         )
+        .route(
+            "/debug/sessions/:id/peers",
+            get(handlers::debug_session_peers),
+        )
         .with_state(shared_storage.clone())
         .layer(Extension(signaling_state.clone()))
         .layer(Extension(viewer_token_verifier.clone()));

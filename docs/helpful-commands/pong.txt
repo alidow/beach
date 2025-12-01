@@ -4,6 +4,10 @@
 export CLERK_JWKS_URL=${CLERK_JWKS_URL:-https://shining-sunbird-15.clerk.accounts.dev/.well-known/jwks.json}
 export CLERK_ISSUER=${CLERK_ISSUER:-https://shining-sunbird-15.clerk.accounts.dev}
 export CLERK_AUDIENCE=${CLERK_AUDIENCE:-private-beach-manager}
+# DNS/session server: add `127.0.0.1 api.beach.dev` to /etc/hosts. Containers
+# map api.beach.dev -> host-gateway so use http://api.beach.dev:4132 for the
+# session server inside/outside Docker. Set BEACH_SESSION_SERVER_BASE to
+# override globally; other URLs derive from it.
 
 LOG_DIR="$HOME/beach-debug"
 mkdir -p "$LOG_DIR"
@@ -17,7 +21,7 @@ cargo build --bin beach >/dev/null
 ~/development/beach/target/debug/beach \
   --log-level "$PONG_LOG_LEVEL" \
   --log-file /tmp/beach-host.log \
-  --session-server http://localhost:4132/ \
+  --session-server http://api.beach.dev:4132/ \
   host \
   --bootstrap-output json \
   --wait \
@@ -221,3 +225,26 @@ direnv exec . docker compose exec beach-manager bash -lc '
   cd /app && ./apps/private-beach/demo/pong/tools/run-agent.sh <private-beach-id>
 '
 
+
+
+
+----
+
+
+
+direnv exec . sh -c 'BEACH_SESSION_SERVER=http://api.beach.dev:4132 PONG_WATCHDOG_INTERVAL=10.0 \
+BEACH_MANAGER_STDOUT_LOG=trace BEACH_MANAGER_FILE_LOG=trace BEACH_MANAGER_TRACE_DEPS=1 \
+RUST_LOG="beach::transport::webrtc=trace,beach::transport::webrtc::signaling=trace,beach::session=debug" \
+DEV_ALLOW_INSECURE_MANAGER_TOKEN=1 DEV_MANAGER_INSECURE_TOKEN=DEV-MANAGER-TOKEN \
+PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN PRIVATE_BEACH_BYPASS_AUTH=0 \
+./scripts/dockerdown --postgres-only && docker compose down && docker compose build beach-manager && docker compose up -d'
+
+
+DEV_ALLOW_INSECURE_MANAGER_TOKEN=1 \
+DEV_MANAGER_INSECURE_TOKEN=DEV-MANAGER-TOKEN \
+PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN \
+NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN \
+PRIVATE_BEACH_BYPASS_AUTH=0 \
+BEACH_SESSION_SERVER=http://api.beach.dev:4132 \
+PONG_WATCHDOG_INTERVAL=10.0 \
+direnv exec . ./apps/private-beach/demo/pong/tools/pong-stack.sh start <private beach id>

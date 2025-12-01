@@ -19,8 +19,9 @@ use uuid::Uuid;
 
 use crate::state::{
     AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerEvent,
-    ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence, JoinSessionResponsePayload,
-    PairingTransportKind, PairingTransportStatus, SessionSummary, StateError,
+    ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
+    JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
+    StateError,
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -1080,7 +1081,7 @@ pub async fn join_session(
         mcp = body.mcp,
         "join_session proxy request"
     );
-    let (status, payload) = state
+    let (status, mut payload) = state
         .join_session_via_road(
             &session_id,
             body.passphrase.clone(),
@@ -1108,6 +1109,15 @@ pub async fn join_session(
             .clone()
             .unwrap_or_else(|| format!("join failed with status {}", status));
         return Err(ApiError::BadRequest(message));
+    }
+
+    if payload.success {
+        if let Some((ice_servers, expires_at_ms)) =
+            state.gate_turn_credentials_or_dev_fallback().await
+        {
+            payload.ice_servers = Some(ice_servers);
+            payload.ice_servers_expires_at_ms = Some(expires_at_ms);
+        }
     }
 
     info!(

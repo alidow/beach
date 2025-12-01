@@ -10,38 +10,43 @@ use futures::stream;
 use serde_json::json;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, info, trace, warn};
+use transport_bus::Bus;
 
 use crate::metrics;
-use crate::protocol::{ExtensionFrame, HostFrame, decode_host_frame_binary};
+use crate::protocol::{ExtensionFrame, HostFrame};
 use crate::transport::{
-    ExtensionDirection, ExtensionLane, Transport, TransportError, extensions, framed,
+    ExtensionDirection, ExtensionLane, Transport,
+    bus::{UnifiedBus, manager_bus_from_client},
+    extensions,
 };
 
-const FASTPATH_NAMESPACE: &str = "fastpath";
+const BUS_NAMESPACE: &str = "manager";
+const LEGACY_NAMESPACE: &str = "fastpath";
+const TOPIC_ACTION: &str = "controller/input";
+const TOPIC_ACK: &str = "controller/ack";
+const TOPIC_STATE: &str = "controller/state";
+const TOPIC_HEALTH: &str = "controller/health";
 const KIND_ACTION: &str = "action";
 const KIND_ACK: &str = "ack";
 const KIND_STATE: &str = "state";
 const KIND_HEALTH: &str = "health";
-const CONTROLLER_NAMESPACE: &str = "controller";
-const CONTROLLER_KIND_INPUT: &str = "input";
-const CONTROLLER_KIND_ACK: &str = "ack";
-const CONTROLLER_KIND_STATE: &str = "state";
-const CONTROLLER_KIND_HEALTH: &str = "health";
+const CONTROLLER_KIND_INPUT: &str = "controller/input";
+const CONTROLLER_KIND_ACK: &str = "controller/ack";
+const CONTROLLER_KIND_STATE: &str = "controller/state";
+const CONTROLLER_KIND_HEALTH: &str = "controller/health";
 
 /// Bridge that adapts a negotiated [`Transport`] to Beach Buggy's `ManagerTransport` trait
 /// using unified transport extension frames.
-#[derive(Clone)]
 pub struct UnifiedBuggyTransport {
     transport: Arc<dyn Transport>,
+    bus: Arc<UnifiedBus>,
     actions_tx: broadcast::Sender<ActionCommand>,
     actions_rx: Arc<Mutex<broadcast::Receiver<ActionCommand>>>,
-    use_transport_pump: bool,
-    framed_rx: Option<Arc<Mutex<broadcast::Receiver<framed::FramedMessage>>>>,
 }
 
 impl UnifiedBuggyTransport {
     pub fn new(transport: Arc<dyn Transport>) -> Self {
-        Self::new_with_pump(transport, true)
+        Self::new_with_pump(transport)
     }
 
     /// Creates a bridge that relies on external extension publication (via the
@@ -49,44 +54,43 @@ impl UnifiedBuggyTransport {
     /// Use this when the transport is already being consumed by another reader
     /// (e.g. the host input listener) to avoid racing on `recv`.
     pub fn new_with_subscription(transport: Arc<dyn Transport>) -> Self {
-        Self::new_with_pump(transport, false)
+        Self::new_with_pump(transport)
     }
 
-    fn new_with_pump(transport: Arc<dyn Transport>, use_transport_pump: bool) -> Self {
+    fn new_with_pump(transport: Arc<dyn Transport>) -> Self {
         let (actions_tx, actions_rx) = broadcast::channel(64);
-        let transport_clone = transport.clone();
-        let actions_tx_clone = actions_tx.clone();
-        // Prime the channel with any buffered frames when we own the transport
-        // reader; otherwise we rely on external subscribers to deliver frames.
-        if use_transport_pump {
-            pump_pending_extensions(&transport_clone, &actions_tx_clone);
+        let bus = Arc::new(manager_bus_from_client(transport.clone()));
+        // Subscribe to bus topic for controller input and forward into actions_tx.
+        {
+            let mut bus_rx = bus.subscribe(TOPIC_ACTION);
+            let actions_tx_forward = actions_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(msg) = bus_rx.recv().await {
+                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                        if let Ok(action) = parse_action_payload(text) {
+                            let _ = actions_tx_forward.send(action);
+                        }
+                    }
+                }
+            });
         }
-        let framed_rx = Some(Arc::new(Mutex::new(framed::subscribe(
-            transport.id(),
-            CONTROLLER_NAMESPACE,
-        ))));
         Self {
             transport,
+            bus,
             actions_tx,
             actions_rx: Arc::new(Mutex::new(actions_rx)),
-            use_transport_pump,
-            framed_rx,
         }
     }
 
     fn make_frame(kind: &str, payload: impl Into<Vec<u8>>) -> ExtensionFrame {
         ExtensionFrame {
-            namespace: FASTPATH_NAMESPACE.to_string(),
+            namespace: BUS_NAMESPACE.to_string(),
             kind: kind.to_string(),
             payload: payload.into().into(),
         }
     }
 
     async fn next_actions(&self) -> HarnessResult<Vec<ActionCommand>> {
-        if self.use_transport_pump {
-            pump_pending_extensions(&self.transport, &self.actions_tx);
-        }
-        pump_pending_framed(&self.framed_rx, &self.actions_tx).await;
         let mut rx = self.actions_rx.lock().await;
         let mut actions = Vec::new();
         loop {
@@ -136,26 +140,31 @@ impl UnifiedBuggyTransport {
     }
 
     async fn send_controller_frame(&self, kind: &str, payload: Vec<u8>) -> HarnessResult<()> {
-        match self
-            .transport
-            .send_namespaced(CONTROLLER_NAMESPACE, kind, &payload)
-        {
-            Ok(_) => Ok(()),
-            Err(TransportError::Setup(_)) => {
-                // Fallback to unified extension path for transports that do not support
-                // namespaced framing (e.g., tests over IPC/WebSocket).
-                self.send_extension_frame(
-                    ExtensionDirection::ClientToHost,
-                    Self::make_frame(kind, payload),
-                )
-                .await
-            }
-            Err(err) => Err(HarnessError::Transport(err.to_string())),
-        }
+        let topic = match kind {
+            KIND_ACTION | CONTROLLER_KIND_INPUT => TOPIC_ACTION,
+            KIND_ACK | CONTROLLER_KIND_ACK => TOPIC_ACK,
+            KIND_STATE | CONTROLLER_KIND_STATE => TOPIC_STATE,
+            KIND_HEALTH | CONTROLLER_KIND_HEALTH => TOPIC_HEALTH,
+            other => other,
+        };
+        self.bus
+            .publish(topic, payload.into())
+            .map_err(|err| HarnessError::Transport(err.to_string()))
     }
 
     pub fn ingest_extension_frame(&self, frame: ExtensionFrame) {
-        handle_extension_frame(&self.transport, &self.actions_tx, frame);
+        if (frame.namespace == BUS_NAMESPACE || frame.namespace == LEGACY_NAMESPACE)
+            && frame.kind == TOPIC_ACTION
+        {
+            if let Ok(text) = std::str::from_utf8(&frame.payload) {
+                if let Ok(action) = parse_action_payload(text) {
+                    let _ = self.actions_tx.send(action);
+                }
+            }
+            return;
+        }
+        // Fallback: publish to per-transport extension bus for any listeners.
+        extensions::publish(self.transport.id(), frame);
     }
 }
 
@@ -246,135 +255,6 @@ impl ControllerTransport for UnifiedBuggyTransport {
     }
 }
 
-fn pump_pending_extensions(
-    transport: &Arc<dyn Transport>,
-    actions_tx: &broadcast::Sender<ActionCommand>,
-) {
-    loop {
-        match transport.try_recv() {
-            Ok(Some(message)) => {
-                if let crate::transport::Payload::Binary(bytes) = message.payload {
-                    match decode_host_frame_binary(&bytes) {
-                        Ok(HostFrame::Extension { frame }) => {
-                            handle_extension_frame(transport, actions_tx, frame);
-                        }
-                        Ok(_) => {}
-                        Err(err) => debug!(
-                            target = "unified_transport",
-                            error = %err,
-                            "failed to decode host frame in extension pump"
-                        ),
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(crate::transport::TransportError::Timeout) => {}
-            Err(crate::transport::TransportError::ChannelClosed) => break,
-            Err(crate::transport::TransportError::Setup(e)) => {
-                warn!(target = "unified_transport", error = %e, "transport setup error");
-                break;
-            }
-        }
-    }
-}
-
-fn handle_extension_frame(
-    transport: &Arc<dyn Transport>,
-    actions_tx: &broadcast::Sender<ActionCommand>,
-    frame: ExtensionFrame,
-) {
-    metrics::EXTENSION_RECEIVED
-        .with_label_values(&[&frame.namespace, &frame.kind, "host"])
-        .inc();
-    trace!(
-        target = "unified_transport",
-        transport_id = %transport.id().0,
-        namespace = %frame.namespace,
-        kind = %frame.kind,
-        payload_len = frame.payload.len(),
-        "received extension frame"
-    );
-
-    if frame.namespace == FASTPATH_NAMESPACE && frame.kind == KIND_ACTION {
-        match std::str::from_utf8(&frame.payload) {
-            Ok(text) => match parse_action_payload(text) {
-                Ok(action) => {
-                    let _ = actions_tx.send(action);
-                }
-                Err(err) => warn!(
-                    target = "unified_transport",
-                    error = %err,
-                    "failed to parse action extension frame"
-                ),
-            },
-            Err(err) => warn!(
-                target = "unified_transport",
-                error = %err,
-                "invalid utf8 in action extension payload"
-            ),
-        }
-    } else {
-        trace!(
-            target = "unified_transport",
-            transport_id = %transport.id().0,
-            namespace = %frame.namespace,
-            kind = %frame.kind,
-            payload_len = frame.payload.len(),
-            "extension frame ignored (namespace not handled)"
-        );
-        extensions::publish(transport.id(), frame);
-    }
-}
-
-async fn pump_pending_framed(
-    framed_rx: &Option<Arc<Mutex<broadcast::Receiver<framed::FramedMessage>>>>,
-    actions_tx: &broadcast::Sender<ActionCommand>,
-) {
-    if let Some(rx_arc) = framed_rx {
-        let mut rx = rx_arc.lock().await;
-        loop {
-            match rx.try_recv() {
-                Ok(frame) => handle_framed_frame(frame, actions_tx),
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    warn!(
-                        target = "unified_transport",
-                        skipped, "lagged receiving framed controller frames"
-                    );
-                    continue;
-                }
-                Err(broadcast::error::TryRecvError::Closed) => break,
-            }
-        }
-    }
-}
-
-fn handle_framed_frame(
-    frame: framed::FramedMessage,
-    actions_tx: &broadcast::Sender<ActionCommand>,
-) {
-    if frame.namespace != CONTROLLER_NAMESPACE || frame.kind != CONTROLLER_KIND_INPUT {
-        return;
-    }
-    match std::str::from_utf8(&frame.payload) {
-        Ok(text) => match parse_action_payload(text) {
-            Ok(action) => {
-                let _ = actions_tx.send(action);
-            }
-            Err(err) => warn!(
-                target = "unified_transport",
-                error = %err,
-                "failed to parse controller framed input"
-            ),
-        },
-        Err(err) => warn!(
-            target = "unified_transport",
-            error = %err,
-            "invalid utf8 in controller framed payload"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,8 +281,8 @@ mod tests {
         });
         let frame = HostFrame::Extension {
             frame: ExtensionFrame {
-                namespace: FASTPATH_NAMESPACE.to_string(),
-                kind: KIND_ACTION.to_string(),
+                namespace: BUS_NAMESPACE.to_string(),
+                kind: TOPIC_ACTION.to_string(),
                 payload: serde_json::to_vec(&action_payload).unwrap().into(),
             },
         };
@@ -477,8 +357,8 @@ mod tests {
                 other => panic!("unexpected frame {other:?}"),
             }
         }
-        assert!(kinds.contains(&KIND_STATE.to_string()));
-        assert!(kinds.contains(&KIND_ACK.to_string()));
+        assert!(kinds.contains(&TOPIC_STATE.to_string()));
+        assert!(kinds.contains(&TOPIC_ACK.to_string()));
     }
 
     #[tokio::test]

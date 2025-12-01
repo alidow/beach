@@ -79,14 +79,18 @@ shift
 
 SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
 MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
-SESSION_SERVER=${PONG_SESSION_SERVER:-http://beach-road:4132/}
+SESSION_SERVER_BASE=${BEACH_SESSION_SERVER_BASE:-}
+SESSION_SERVER=${SESSION_SERVER_BASE:-${PONG_SESSION_SERVER:-http://api.beach.dev:4132/}}
 AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://beach-gate:4133}
 CLI_PROFILE=${PONG_BEACH_PROFILE:-local}
 LOG_ROOT=${PONG_LOG_ROOT:-/tmp/pong-stack}
 LOG_DIR=${PONG_LOG_DIR:-$LOG_ROOT}
 CODES_WAIT=${PONG_CODES_WAIT:-8}
-ROLE_BOOTSTRAP_TIMEOUT=${PONG_ROLE_BOOTSTRAP_TIMEOUT:-40}
+ROLE_BOOTSTRAP_TIMEOUT=${PONG_ROLE_BOOTSTRAP_TIMEOUT:-180}
 ROLE_BOOTSTRAP_INTERVAL=${PONG_ROLE_BOOTSTRAP_INTERVAL:-1}
+if [[ -z "${PONG_ROLE_BOOTSTRAP_TIMEOUT:-}" ]]; then
+  ROLE_BOOTSTRAP_TIMEOUT=420
+fi
 REPO_ROOT=/app
 CARGO_BIN_DIR=${PONG_CARGO_BIN_DIR:-/usr/local/cargo/bin}
 PLAYER_LOG_LEVEL=${PONG_LOG_LEVEL:-info}
@@ -97,6 +101,18 @@ CONTAINER_ICE_HOST=${PONG_STACK_CONTAINER_ICE_HOST:-}
 PONG_FRAME_DUMP_DIR=${PONG_FRAME_DUMP_DIR:-$LOG_DIR/frame-dumps}
 PONG_BALL_TRACE_DIR=${PONG_BALL_TRACE_DIR:-$LOG_DIR/ball-trace}
 PONG_COMMAND_TRACE_DIR=${PONG_COMMAND_TRACE_DIR:-$LOG_DIR/command-trace}
+PONG_STATE_TRACE_DIR=${PONG_STATE_TRACE_DIR:-$LOG_DIR/state-trace}
+PONG_STATE_TRACE_INTERVAL=${PONG_STATE_TRACE_INTERVAL:-1}
+# Resolve a host-side LAN IP once so we can inject a browser-reachable ICE hint
+# into the container when none is explicitly provided.
+if [[ -z "$CONTAINER_ICE_IP" ]]; then
+  if LAN_IP=$(ipconfig getifaddr "$(route get default | awk '/interface:/{print $2}')" 2>/dev/null); then
+    CONTAINER_ICE_IP="$LAN_IP"
+  fi
+fi
+if [[ -z "$CONTAINER_ICE_HOST" ]]; then
+  CONTAINER_ICE_HOST="$CONTAINER_ICE_IP"
+fi
 CONTAINER_ENV_PREFIX=""
 # Preserve NAT hints by default so hosts advertise a reachable address; allow explicit overrides.
 if [[ -n "$CONTAINER_ICE_IP" ]]; then
@@ -105,9 +121,39 @@ fi
 if [[ -n "$CONTAINER_ICE_HOST" ]]; then
   CONTAINER_ENV_PREFIX+=" export BEACH_ICE_PUBLIC_HOST='$CONTAINER_ICE_HOST';"
 fi
+# Force transport/debug logging to keep attach/bridge traces visible regardless of host env.
+CONTAINER_ENV_PREFIX+=" export RUST_LOG='info,beach::transport::webrtc=debug,transport.extension=debug,controller.actions=debug,private_beach=debug,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace';"
+
+# Ensure BEACH_TURN_EXTERNAL_IP is exported for docker compose if not already set.
+if [[ -z "${BEACH_TURN_EXTERNAL_IP:-}" ]]; then
+  if [[ -n "${LAN_IP:-}" ]]; then
+    export BEACH_TURN_EXTERNAL_IP="$LAN_IP"
+  elif LAN_IP=$(ipconfig getifaddr "$(route get default | awk '/interface:/{print $2}')" 2>/dev/null); then
+    export BEACH_TURN_EXTERNAL_IP="$LAN_IP"
+  fi
+fi
+# Default insecure manager token for dev/bypass flows.
+: "${DEV_MANAGER_INSECURE_TOKEN:=DEV-MANAGER-TOKEN}"
+: "${PRIVATE_BEACH_BYPASS_AUTH:=1}"
 HOST_MANAGER_TOKEN=${HOST_MANAGER_TOKEN:-""}
 HOST_TOKEN_EXPORT=${HOST_TOKEN_EXPORT:-""}
 STACK_MANAGER_TOKEN=${STACK_MANAGER_TOKEN:-""}
+if [[ -n "${BEACH_TOKEN:-}" ]]; then
+  CONTAINER_ENV_PREFIX+=" export BEACH_TOKEN='$BEACH_TOKEN';"
+fi
+# Ensure dev/bypass tokens are present for manager API calls even if CLI creds are absent.
+if [[ -n "${DEV_ALLOW_INSECURE_MANAGER_TOKEN:-1}" ]]; then
+  CONTAINER_ENV_PREFIX+=" export DEV_ALLOW_INSECURE_MANAGER_TOKEN='1';"
+fi
+if [[ -n "${DEV_MANAGER_INSECURE_TOKEN:-}" ]]; then
+  CONTAINER_ENV_PREFIX+=" export DEV_MANAGER_INSECURE_TOKEN='${DEV_MANAGER_INSECURE_TOKEN}';"
+fi
+if [[ -n "${PRIVATE_BEACH_MANAGER_TOKEN:-}" ]]; then
+  CONTAINER_ENV_PREFIX+=" export PRIVATE_BEACH_MANAGER_TOKEN='${PRIVATE_BEACH_MANAGER_TOKEN}';"
+fi
+if [[ -n "${PRIVATE_BEACH_BYPASS_AUTH:-1}" ]]; then
+  CONTAINER_ENV_PREFIX+=" export PRIVATE_BEACH_BYPASS_AUTH='${PRIVATE_BEACH_BYPASS_AUTH:-1}';"
+fi
 API_RESPONSE=""
 API_STATUS=""
 
@@ -199,7 +245,12 @@ ensure_host_account() {
 
 run_in_container() {
   local cmd="$1"
-  docker compose exec -T "$SERVICE" bash -c "$CONTAINER_ENV_PREFIX export PATH=\"$CARGO_BIN_DIR:\\$PATH\"; $cmd"
+  if [[ -n "${PONG_DEBUG_RUN_IN_CONTAINER:-}" ]]; then
+    echo "[run_in_container] cmd begin" >&2
+    echo "$cmd" >&2
+    echo "[run_in_container] cmd end" >&2
+  fi
+  printf '%s\n' "$cmd" | docker compose exec -T "$SERVICE" bash -lc "${CONTAINER_ENV_PREFIX} export PATH=\"$CARGO_BIN_DIR:\\$PATH\"; cat > /tmp/pong-run.sh; bash /tmp/pong-run.sh"
 }
 
 # Fresh per-run log directory: timestamped by default, with a stable "latest" symlink.
@@ -209,14 +260,17 @@ if [[ "$COMMAND" == start* ]]; then
   fi
   run_in_container "set -euo pipefail; mkdir -p '$LOG_ROOT'; rm -rf '$LOG_DIR'; mkdir -p '$LOG_DIR'; ln -sfn '$LOG_DIR' '$LOG_ROOT/latest'"
   # Recompute trace dirs after LOG_DIR is finalized.
-  if [[ -z "${PONG_FRAME_DUMP_DIR+set}" ]]; then
+  if [[ -z "${PONG_FRAME_DUMP_DIR+x}" || "$PONG_FRAME_DUMP_DIR" == "$LOG_ROOT/frame-dumps" ]]; then
     PONG_FRAME_DUMP_DIR="$LOG_DIR/frame-dumps"
   fi
-  if [[ -z "${PONG_BALL_TRACE_DIR+set}" ]]; then
+  if [[ -z "${PONG_BALL_TRACE_DIR+x}" || "$PONG_BALL_TRACE_DIR" == "$LOG_ROOT/ball-trace" ]]; then
     PONG_BALL_TRACE_DIR="$LOG_DIR/ball-trace"
   fi
-  if [[ -z "${PONG_COMMAND_TRACE_DIR+set}" ]]; then
+  if [[ -z "${PONG_COMMAND_TRACE_DIR+x}" || "$PONG_COMMAND_TRACE_DIR" == "$LOG_ROOT/command-trace" ]]; then
     PONG_COMMAND_TRACE_DIR="$LOG_DIR/command-trace"
+  fi
+  if [[ -z "${PONG_STATE_TRACE_DIR+x}" || "$PONG_STATE_TRACE_DIR" == "$LOG_ROOT/state-trace" ]]; then
+    PONG_STATE_TRACE_DIR="$LOG_DIR/state-trace"
   fi
 fi
 
@@ -244,11 +298,132 @@ ensure_service_running() {
   fi
 }
 
-ensure_cli_login() {
-  if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
-    return
+get_forge_script() {
+cat <<'EOF'
+import os
+import time
+import json
+import base64
+import sys
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+def base64url_encode(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=')
+
+repo_root = os.getcwd()
+key_path = os.path.join(repo_root, "config/dev-secrets/beach-gate-ec256.pem")
+kid_path = os.path.join(repo_root, "config/dev-secrets/beach-gate-signing.kid")
+
+if not os.path.exists(key_path):
+    print(f"Warning: Keys not found at {key_path}, skipping token injection", file=sys.stderr)
+    sys.exit(0)
+
+try:
+    with open(key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+    with open(kid_path, "r") as f:
+        kid = f.read().strip()
+except FileNotFoundError:
+    print(f"Warning: Keys not found at {key_path}, skipping token injection", file=sys.stderr)
+    sys.exit(0)
+
+header = {
+    "alg": "ES256",
+    "kid": kid,
+    "typ": "JWT"
+}
+
+now = int(time.time())
+exp = now + 365 * 24 * 3600  # 1 year
+
+payload = {
+    "iss": "beach-gate",
+    "sub": "00000000-0000-0000-0000-000000000001",
+    "aud": "private-beach-manager",
+    "exp": exp,
+    "iat": now,
+    "entitlements": ["private-beach:turn", "rescue:fallback", "pb:transport.turn", "pb:harness.publish"],
+    "tier": "standard",
+    "profile": "default",
+    "email": "mock-user@beach.test",
+    "account_id": "00000000-0000-0000-0000-000000000001",
+    "scope": "rescue:fallback private-beach:turn pb:beaches.read pb:beaches.write pb:sessions.read pb:sessions.write pb:control.read pb:control.write pb:control.consume pb:agents.onboard pb:harness.publish"
+}
+
+header_json = json.dumps(header, separators=(',', ':')).encode('utf-8')
+payload_json = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+
+header_b64 = base64url_encode(header_json)
+payload_b64 = base64url_encode(payload_json)
+
+signing_input = header_b64 + b'.' + payload_b64
+signature = private_key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+
+r, s = decode_dss_signature(signature)
+r_bytes = r.to_bytes(32, byteorder='big')
+s_bytes = s.to_bytes(32, byteorder='big')
+raw_signature = r_bytes + s_bytes
+signature_b64 = base64url_encode(raw_signature)
+
+token = (header_b64 + b'.' + payload_b64 + b'.' + signature_b64).decode('utf-8')
+
+gateway = os.environ.get("BEACH_AUTH_GATEWAY", "http://beach-gate:4133")
+creds_path = os.path.expanduser("~/.beach/credentials")
+os.makedirs(os.path.dirname(creds_path), exist_ok=True)
+
+toml = f"""current_profile = "forged"
+
+[profiles.forged]
+issuer = "{gateway}"
+audience = "private-beach-manager"
+updated_at = "{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}"
+entitlements = ["private-beach:turn", "rescue:fallback", "pb:transport.turn", "pb:harness.publish"]
+
+[profiles.forged.refresh]
+kind = "plain"
+token = "dummy-refresh-token"
+
+[profiles.forged.access_token]
+token = "{token}"
+expires_at = "2030-01-01T00:00:00Z"
+entitlements = ["private-beach:turn", "rescue:fallback", "pb:transport.turn", "pb:harness.publish"]
+"""
+
+print(toml)
+EOF
+}
+
+inject_container_credentials() {
+  local container_name="$1"
+  
+  # Ensure credentials file exists
+  if [ ! -f ~/.beach/credentials ]; then
+      echo "Error: ~/.beach/credentials not found. Credentials should be forged globally."
+      exit 1
   fi
-  run_in_container "set -euo pipefail; if [[ ! -s \$HOME/.beach/credentials ]]; then echo '[pong-stack] no beach CLI credentials found; launching beach login...' >&2; cd $REPO_ROOT; BEACH_AUTH_GATEWAY='$AUTH_GATEWAY' cargo run --bin beach -- login --name '$CLI_PROFILE' --force; fi"
+
+  echo "Injecting credentials into $container_name..."
+  
+  # Create .beach directory in container
+  run_in_container "mkdir -p /root/.beach"
+  
+  # Copy credentials file from host to container
+  docker cp ~/.beach/credentials "$container_name:/root/.beach/credentials"
+  
+  # Set permissions
+  run_in_container "chmod 600 /root/.beach/credentials"
+  
+  # Read the token back to pass as env var
+  BEACH_TOKEN=$(grep "token =" ~/.beach/credentials | grep -v "dummy-refresh-token" | head -n 1 | cut -d '"' -f 2)
+  export BEACH_TOKEN
+}
+
+ensure_cli_login() {
+  # We are injecting credentials directly, so we can skip CLI login check
+  # But we need to ensure the container is running first
+  echo "[pong-stack] skipping beach login inside container (forwarding host token)"
 }
 
 start_player() {
@@ -268,7 +443,57 @@ start_player() {
   if [[ -n "${PONG_COMMAND_TRACE_DIR:-}" ]]; then
     frame_env+="mkdir -p '$PONG_COMMAND_TRACE_DIR'; : > '$PONG_COMMAND_TRACE_DIR/command-$mode.log'; export PONG_COMMAND_TRACE_PATH='$PONG_COMMAND_TRACE_DIR/command-$mode.log'; "
   fi
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${frame_env}cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
+  if [[ -n "${PONG_STATE_TRACE_DIR:-}" ]]; then
+    frame_env+="mkdir -p '$PONG_STATE_TRACE_DIR'; : > '$PONG_STATE_TRACE_DIR/state-$mode.jsonl'; export PONG_STATE_TRACE_PATH='$PONG_STATE_TRACE_DIR/state-$mode.jsonl'; "
+  fi
+  if [[ -n "${PONG_STATE_TRACE_INTERVAL:-}" ]]; then
+    frame_env+="export PONG_STATE_TRACE_INTERVAL='${PONG_STATE_TRACE_INTERVAL}'; "
+  fi
+  # Use global HOST_MANAGER_TOKEN
+  local host_token="$HOST_MANAGER_TOKEN"
+  
+  if [[ -z "$host_token" ]]; then
+      echo "Error: HOST_MANAGER_TOKEN not set. Credentials should be forged globally." >&2
+      exit 1
+  fi
+
+  cmd=$(cat <<EOF
+set -euo pipefail
+export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'
+export BEACH_SESSION_SERVER_BASE='$SESSION_SERVER'
+export BEACH_SESSION_SERVER='$SESSION_SERVER'
+export BEACH_ROAD_URL='$SESSION_SERVER'
+export BEACH_PUBLIC_SESSION_SERVER='$SESSION_SERVER'
+export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'
+export LOG_DIR='$LOG_DIR'
+export MODE='$mode'
+export SESSION_SERVER='$SESSION_SERVER'
+export REPO_ROOT='$REPO_ROOT'
+export CARGO_RUN_RETRIES='${CARGO_RUN_RETRIES:-12}'
+export CARGO_RUN_RETRY_DELAY='${CARGO_RUN_RETRY_DELAY:-5}'
+${frame_env}
+cd $REPO_ROOT
+mkdir -p '$LOG_DIR'
+: > '$LOG_DIR/beach-host-$mode.log'
+echo 'DEBUG: id' >> '$LOG_DIR/beach-host-$mode.log'; id >> '$LOG_DIR/beach-host-$mode.log'
+echo 'DEBUG: env' >> '$LOG_DIR/beach-host-$mode.log'; env >> '$LOG_DIR/beach-host-$mode.log'
+
+# Pass token from host
+unset PB_MANAGER_TOKEN PB_MCP_TOKEN PB_CONTROLLER_TOKEN BEACH_TOKEN
+export BEACH_TOKEN='$host_token'
+echo "DEBUG: BEACH_TOKEN=\$BEACH_TOKEN" >> '$LOG_DIR/beach-host-$mode.log'
+
+# Unset potential conflicting auth variables (except BEACH_TOKEN)
+unset HOST_MANAGER_TOKEN BEACH_ACCESS_TOKEN CLERK_SECRET_KEY
+EOF
+)
+
+  cmd+=$'\n'"$(cat <<'EOF'
+  nohup setsid bash -c 'attempt=0; rc=1; while true; do cargo run --bin beach -- --log-level "debug" --log-file "$LOG_DIR/beach-host-$MODE.log" --session-server "$SESSION_SERVER" host --bootstrap-output json --wait -- /usr/bin/env python3 "$REPO_ROOT/apps/private-beach/demo/pong/player/main.py" --mode "$MODE" 2>&1 | tee "$LOG_DIR/bootstrap-$MODE.json" > "$LOG_DIR/player-$MODE.log"; rc=${PIPESTATUS[0]}; if [[ $rc -eq 0 ]]; then break; fi; attempt=$((attempt+1)); if [[ $attempt -ge ${CARGO_RUN_RETRIES:-12} ]]; then echo "cargo run failed after retries; giving up" >&2; exit $rc; fi; echo "cargo run failed (rc=$rc); retrying after ${CARGO_RUN_RETRY_DELAY:-5}s (attempt $attempt)..."; sleep ${CARGO_RUN_RETRY_DELAY:-5}; done' >/dev/null 2>&1 & echo $! > "$LOG_DIR/player-$MODE.pid"
+EOF
+)"
+
+  run_in_container "$cmd"
   echo "launched $human player (logs in $LOG_DIR/player-$mode.log)"
 }
 
@@ -277,7 +502,7 @@ start_agent() {
   if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
     ensure_host_account
   fi
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export PRIVATE_BEACH_ID='$beach_id'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${HOST_TOKEN_EXPORT}export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; export PONG_WATCHDOG_INTERVAL='${PONG_WATCHDOG_INTERVAL:-}'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
+  run_in_container "set -euo pipefail; export HOME='/root'; export BEACH_CREDENTIALS_FILE='/root/.beach/credentials'; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export PRIVATE_BEACH_ID='$beach_id'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_SESSION_SERVER_BASE='${SESSION_SERVER}'; export BEACH_SESSION_SERVER='$SESSION_SERVER'; export BEACH_ROAD_URL='$SESSION_SERVER'; export BEACH_PUBLIC_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; unset PB_MANAGER_TOKEN PB_MCP_TOKEN PB_CONTROLLER_TOKEN BEACH_TOKEN; ${HOST_TOKEN_EXPORT} export PB_MANAGER_TOKEN='${HOST_MANAGER_TOKEN}'; export PB_MCP_TOKEN='${HOST_MANAGER_TOKEN}'; export PB_CONTROLLER_TOKEN='${HOST_MANAGER_TOKEN}'; export BEACH_TOKEN='${HOST_MANAGER_TOKEN}'; export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; export PONG_WATCHDOG_INTERVAL='${PONG_WATCHDOG_INTERVAL:-}'; mkdir -p /root/.beach && chmod 700 /root/.beach && chown root:root /root/.beach/credentials || true; chmod 600 /root/.beach/credentials || true; cat /root/.beach/credentials >/dev/null; { echo \"ENV_DUMP_START\"; env | grep -E '^(PB_|BEACH_|PRIVATE_BEACH_|RUN_AGENT_|PONG_)'; echo \"ENV_DUMP_END\"; } >> '$LOG_DIR/agent.env'; echo \"PB_MANAGER_TOKEN length=\${#PB_MANAGER_TOKEN}\" >> '$LOG_DIR/agent.log'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
   echo "launched pong agent (logs in $LOG_DIR/agent.log)"
 }
 
@@ -534,6 +759,11 @@ get_stack_manager_token() {
     printf '%s\n' "$STACK_MANAGER_TOKEN"
     return 0
   fi
+  if [[ -n "$DEV_MANAGER_INSECURE_TOKEN" ]]; then
+    STACK_MANAGER_TOKEN="$DEV_MANAGER_INSECURE_TOKEN"
+    printf '%s\n' "$STACK_MANAGER_TOKEN"
+    return 0
+  fi
   if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
     STACK_MANAGER_TOKEN="$HOST_MANAGER_TOKEN"
     printf '%s\n' "$STACK_MANAGER_TOKEN"
@@ -565,6 +795,7 @@ print(json.dumps(payload))
 PY
   if ! manager_api_request "POST" "/private-beaches" "$payload_file"; then
     rm -f "$payload_file"
+    echo "[pong-stack] create beach failed. Response: $API_RESPONSE" >&2
     return 1
   fi
   rm -f "$payload_file"
@@ -611,11 +842,13 @@ manager_api_request() {
     curl_args+=(-H "content-type: application/json" "--data-binary" "@$body_file")
   fi
   local attempt=0
-  while [[ $attempt -lt 5 ]]; do
+  local max_attempts=${PONG_MANAGER_API_RETRIES:-12}
+  local retry_delay=${PONG_MANAGER_API_RETRY_DELAY:-2}
+  while [[ $attempt -lt $max_attempts ]]; do
     attempt=$((attempt + 1))
     http_code=$(curl "${curl_args[@]}" "$url") || http_code=""
     if [[ -z "$http_code" ]]; then
-      sleep 1
+      sleep "$retry_delay"
       continue
     fi
     if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
@@ -630,6 +863,12 @@ manager_api_request() {
         if [[ -n "$body_file" ]]; then
           curl_args+=(-H "content-type: application/json" "--data-binary" "@$body_file")
         fi
+        continue
+      fi
+    fi
+    if [[ "$http_code" == "000" || "$http_code" == "" || "$http_code" =~ ^5 ]]; then
+      if [[ $attempt -lt $max_attempts ]]; then
+        sleep "$retry_delay"
         continue
       fi
     fi
@@ -1033,11 +1272,60 @@ setup_private_beach() {
   rm -rf "$tmp_dir"
 }
 
+
+
+wait_for_manager_ready() {
+  local url="${MANAGER_URL%/}/healthz"
+  local attempt=0
+  local max_attempts=${PONG_STACK_MANAGER_HEALTH_ATTEMPTS:-240}
+  local interval=${PONG_STACK_MANAGER_HEALTH_INTERVAL:-3}
+  while [[ $attempt -lt $max_attempts ]]; do
+    attempt=$((attempt + 1))
+    if curl -fsS -o /dev/null "$url"; then
+      echo "[pong-stack] manager healthy at $url" >&2
+      return 0
+    fi
+    sleep "$interval"
+  done
+  echo "[pong-stack] manager $MANAGER_URL did not become healthy after $max_attempts attempts" >&2
+  return 1
+}
+
+kill_conflicting_ice_ports() {
+  # Best-effort: free any processes holding the ICE UDP range before starting the stack.
+  local start_port=${BEACH_ICE_PORT_START:-64000}
+  local end_port=${BEACH_ICE_PORT_END:-64100}
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "[pong-stack] lsof not found; skipping ICE port cleanup" >&2
+    return
+  fi
+  echo "[pong-stack] checking for processes on UDP ports ${start_port}-${end_port}..." >&2
+  local lsof_out
+  lsof_out=$(lsof -nP -i UDP:"${start_port}-${end_port}" 2>/dev/null || true)
+  if [[ -z "$lsof_out" ]]; then
+    echo "[pong-stack] no ICE port listeners detected" >&2
+    return
+  fi
+  # Skip Docker/VPNKit plumbing so we don't kill the daemon; only target stray host processes.
+  local pids
+  pids=$(printf '%s\n' "$lsof_out" | awk 'NR>1 && $1 !~ /(docke|vpnkit|containerd)/ {print $2}' | sort -u)
+  if [[ -z "$pids" ]]; then
+    echo "[pong-stack] ICE ports are in use by docker-managed processes; skipping kill" >&2
+    return
+  fi
+  echo "[pong-stack] killing PIDs using ICE ports: $pids" >&2
+  kill -9 $pids 2>/dev/null || true
+}
+
 case "$COMMAND" in
   start)
+    kill_conflicting_ice_ports
     ensure_service_running
     if ! wait_for_manager; then
       echo "[pong-stack] manager $MANAGER_URL did not become healthy; aborting start" >&2
+      exit 1
+    fi
+    if ! wait_for_manager_ready; then
       exit 1
     fi
     prebuild_beach_binary
@@ -1138,7 +1426,10 @@ case "$COMMAND" in
         if [[ "$beach_id" == "__auto_beach__" ]]; then
           beach_id=""
         fi
-        if [[ -z "$beach_id" && "$CREATE_BEACH" == true ]]; then
+        if [[ "$CREATE_BEACH" == true ]]; then
+          if [[ -n "$beach_id" ]]; then
+            echo "[pong-stack] --create-beach set; creating a fresh beach instead of using provided id '$beach_id'" >&2
+          fi
           if ! beach_id=$(create_private_beach); then
             exit 1
           fi
@@ -1155,21 +1446,45 @@ case "$COMMAND" in
         if ! run_showcase_preflight "$beach_id"; then
           exit $?
         fi
-        start_player lhs "LHS"
-        start_player rhs "RHS"
-        start_agent "$beach_id"
-        echo "[pong-stack] waiting for session bootstrap data (timeout ${ROLE_BOOTSTRAP_TIMEOUT}s per role)..."
-        if ! wait_for_role_bootstrap lhs "LHS player"; then
-          stop_stack
-          exit 1
-        fi
-        if ! wait_for_role_bootstrap rhs "RHS player"; then
-          stop_stack
-          exit 1
-        fi
-        if ! wait_for_role_bootstrap agent "Pong agent"; then
-          stop_stack
-          exit 1
+        if [[ -n "$beach_id" ]]; then
+          # Forge credentials once for the session
+          echo "[pong-stack] forging credentials..."
+          get_forge_script > forge_token.py
+          # Install dependencies if needed (assuming they are present or using system python)
+          # We use the embedded python script to generate the credentials file
+          if python3 forge_token.py > ~/.beach/credentials; then
+              echo "[pong-stack] credentials forged successfully"
+              # Update HOST_MANAGER_TOKEN
+              HOST_MANAGER_TOKEN=$(grep "token =" ~/.beach/credentials | grep -v "dummy-refresh-token" | head -n 1 | cut -d '"' -f 2)
+              export HOST_MANAGER_TOKEN
+              HOST_TOKEN_EXPORT="export PB_MANAGER_TOKEN='$HOST_MANAGER_TOKEN'; export PB_MCP_TOKEN='$HOST_MANAGER_TOKEN'; export PB_CONTROLLER_TOKEN='$HOST_MANAGER_TOKEN'; "
+              # Mirror credentials into the container so run-agent can read them directly.
+              run_in_container "mkdir -p /root/.beach && chmod 700 /root/.beach"
+              docker compose cp ~/.beach/credentials "$SERVICE:/root/.beach/credentials"
+              run_in_container "chmod 600 /root/.beach/credentials"
+          else
+              echo "[pong-stack] failed to forge credentials"
+              exit 1
+          fi
+          rm forge_token.py
+
+          ensure_cli_login
+
+          start_player lhs "LHS"
+          if ! wait_for_role_bootstrap lhs "LHS player"; then
+            stop_stack
+            exit 1
+          fi
+          start_player rhs "RHS"
+          if ! wait_for_role_bootstrap rhs "RHS player"; then
+            stop_stack
+            exit 1
+          fi
+          start_agent "$beach_id"
+          if ! wait_for_role_bootstrap agent "Pong agent"; then
+            stop_stack
+            exit 1
+          fi
         fi
         echo "waiting $CODES_WAIT seconds for sessions to register..."
         sleep "$CODES_WAIT"

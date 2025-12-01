@@ -164,6 +164,17 @@ export class ViewerConnectionService {
       window.clearTimeout(existing.pendingDisconnectTimer);
       existing.pendingDisconnectTimer = null;
     }
+    if (existing && existing.key && preparation.ready && existing.key !== preparation.key) {
+      // eslint-disable-next-line no-console
+      console.warn('[viewer-service][replacement]', {
+        tileId,
+        previousKey: existing.key,
+        newKey: preparation.key,
+        sessionId: baseSessionId,
+        privateBeachId: basePrivateBeachId,
+        managerUrl: baseManagerUrl,
+      });
+    }
     debugLog('connectTile.request', {
       trace_id: normalizedTraceId,
       tileId,
@@ -219,6 +230,14 @@ export class ViewerConnectionService {
       debugLog('connectTile.precondition_failed', {
         trace_id: normalizedTraceId,
         tileId,
+        reason: preparation.reason,
+      });
+      // eslint-disable-next-line no-console
+      console.warn('[viewer-service][precondition_failed]', {
+        tileId,
+        sessionId: entry.sessionId,
+        privateBeachId: entry.privateBeachId,
+        managerUrl: entry.managerUrl,
         reason: preparation.reason,
       });
       emitTelemetry('canvas.tile.connect.failure', {
@@ -289,15 +308,26 @@ export class ViewerConnectionService {
 
     this.tiles.set(tileId, entry);
     return () => {
-      this.disconnectTile(tileId);
+      this.disconnectTile(tileId, 'unmount');
     };
   }
 
-  disconnectTile(tileId: string) {
+  disconnectTile(tileId: string, reason: 'unmount' | 'api' | 'replacement' = 'api') {
     const entry = this.tiles.get(tileId);
     if (!entry) {
       return;
     }
+    const disconnectPayload = {
+      trace_id: entry.traceId ?? null,
+      tileId,
+      sessionId: entry.sessionId,
+      privateBeachId: entry.privateBeachId,
+      managerUrl: entry.managerUrl,
+      reason,
+    };
+    debugLog('connectTile.disconnect', disconnectPayload);
+    // eslint-disable-next-line no-console
+    console.warn('[viewer-service][disconnectTile]', disconnectPayload);
     if (entry.pendingDisconnectTimer != null && typeof window !== 'undefined') {
       window.clearTimeout(entry.pendingDisconnectTimer);
       entry.pendingDisconnectTimer = null;
@@ -451,6 +481,8 @@ export class ViewerConnectionService {
     debugLog('connectTile.dispose', {
       trace_id: entry.traceId ?? null,
       tileId,
+      sessionId: entry.sessionId ?? null,
+      managerUrl: entry.managerUrl ?? null,
       reason,
       disposals: entry.metrics.disposed,
     });

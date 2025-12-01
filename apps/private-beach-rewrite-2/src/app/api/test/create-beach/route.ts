@@ -5,7 +5,8 @@ type CreateResponse = { id: string; name?: string };
 export async function POST(request: Request) {
   const token =
     request.headers.get('x-pb-manager-token') ||
-    request.headers.get('cookie')?.split(';').map((c) => c.trim()).find((c) => c.startsWith('pb-manager-token='))?.split('=')[1];
+    request.headers.get('cookie')?.split(';').map((c) => c.trim()).find((c) => c.startsWith('pb-manager-token='))?.split('=')[1] ||
+    process.env.PRIVATE_BEACH_MANAGER_TOKEN;
 
   if (!token) {
     return NextResponse.json({ error: 'missing manager token' }, { status: 401 });

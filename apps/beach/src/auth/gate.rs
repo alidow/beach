@@ -47,7 +47,7 @@ struct ErrorBody {
     detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TurnCredentialsResponse {
     pub realm: String,
@@ -58,7 +58,7 @@ pub struct TurnCredentialsResponse {
     pub ice_servers: Vec<TurnIceServer>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TurnIceServer {
     #[serde(deserialize_with = "deserialize_urls")]
     pub urls: Vec<String>,

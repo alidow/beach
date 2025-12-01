@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.beach_gate_url.clone(),
         cfg.beach_gate_viewer_token.clone(),
     );
+    state = state.with_gate_client(cfg.beach_gate_url.clone());
     state = state.with_controller_strict_gating(cfg.controller_strict_gating);
     state = state.with_idle_snapshot_interval(cfg.idle_snapshot_interval_ms);
 

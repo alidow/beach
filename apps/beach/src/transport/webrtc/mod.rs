@@ -66,6 +66,7 @@ const READY_ACK_POLL_ATTEMPTS: usize = 200;
 const READY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 const CONTROL_PRIORITY_NAMESPACES: &[&str] = &["controller"];
+const BUFFERED_AMOUNT_HIGH_WATER: u64 = 64 * 1024;
 mod secure_handshake;
 mod secure_signaling;
 mod signaling;
@@ -78,6 +79,7 @@ struct IceCandidateInfo {
     ip: IpAddr,
     port: u16,
     scope: &'static str,
+    candidate_type: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,12 +192,23 @@ fn parse_candidate_info(candidate: &str) -> Option<IceCandidateInfo> {
     if parts.len() < 6 {
         return None;
     }
+    let candidate_type = parts
+        .windows(2)
+        .find_map(|w| {
+            if w[0] == "typ" {
+                Some(w[1].to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let ip = parts.get(4)?.parse::<IpAddr>().ok()?;
     let port = parts.get(5)?.parse::<u16>().ok()?;
     Some(IceCandidateInfo {
         scope: classify_candidate_scope(&ip),
         ip,
         port,
+        candidate_type,
     })
 }
 
@@ -329,6 +342,72 @@ fn apply_nat_hint(setting: &mut SettingEngine) {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TransportDiagnostics {
+    pub transport_id: u64,
+    pub role: Option<String>,
+    pub handshake_id: Option<String>,
+    pub session_id: Option<String>,
+    pub peer_session_id: Option<String>,
+    pub remote_peer: Option<String>,
+    pub channel_label: Option<String>,
+    pub last_pc_state: Option<String>,
+    pub last_ice_state: Option<String>,
+    pub last_buffered_amount: Option<u64>,
+    pub buffered_high_water: u64,
+}
+
+static TRANSPORT_DIAGNOSTICS: Lazy<Mutex<HashMap<u64, TransportDiagnostics>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn update_transport_diagnostics<F: FnOnce(&mut TransportDiagnostics)>(id: TransportId, f: F) {
+    let mut guard = TRANSPORT_DIAGNOSTICS.lock().unwrap();
+    let entry = guard.entry(id.0).or_insert_with(|| TransportDiagnostics {
+        transport_id: id.0,
+        ..TransportDiagnostics::default()
+    });
+    f(entry);
+}
+
+pub fn transport_diagnostics(id: TransportId) -> Option<TransportDiagnostics> {
+    let guard = TRANSPORT_DIAGNOSTICS.lock().unwrap();
+    guard.get(&id.0).cloned()
+}
+
+fn record_buffered_amount(id: TransportId, amount: u64) -> Option<u64> {
+    let mut guard = TRANSPORT_DIAGNOSTICS.lock().unwrap();
+    let entry = guard.entry(id.0).or_insert_with(|| TransportDiagnostics {
+        transport_id: id.0,
+        ..TransportDiagnostics::default()
+    });
+    entry.last_buffered_amount = Some(amount);
+    if amount > entry.buffered_high_water {
+        entry.buffered_high_water = amount;
+        return Some(amount);
+    }
+    None
+}
+
+fn log_buffered_high_water(id: TransportId, amount: u64, phase: &str) {
+    if amount < BUFFERED_AMOUNT_HIGH_WATER {
+        return;
+    }
+    let snapshot = transport_diagnostics(id);
+    tracing::warn!(
+        target = "beach::transport::webrtc",
+        transport_id = ?id,
+        phase,
+        session_id = snapshot.as_ref().and_then(|d| d.session_id.as_deref()).unwrap_or(""),
+        channel = snapshot.as_ref().and_then(|d| d.channel_label.as_deref()).unwrap_or(""),
+        peer = snapshot.as_ref().and_then(|d| d.remote_peer.as_deref()).unwrap_or(""),
+        buffered_amount = amount,
+        high_water = snapshot.as_ref().map(|d| d.buffered_high_water).unwrap_or(amount),
+        last_pc_state = snapshot.as_ref().and_then(|d| d.last_pc_state.as_deref()).unwrap_or(""),
+        last_ice_state = snapshot.as_ref().and_then(|d| d.last_ice_state.as_deref()).unwrap_or(""),
+        "data channel buffered_amount exceeded high water"
+    );
 }
 
 fn ice_port_range_hint() -> Option<(u16, u16)> {
@@ -523,6 +602,16 @@ fn log_ice_configuration(role: &'static str, selection: &IceServerSelection, stu
     } else {
         "managed"
     };
+    let has_turn = selection
+        .servers
+        .as_ref()
+        .map(|servers| {
+            servers
+                .iter()
+                .flat_map(|s| s.urls.iter())
+                .any(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+        })
+        .unwrap_or(false);
     tracing::info!(
         target = "beach::transport::webrtc",
         peer_role = role,
@@ -530,6 +619,7 @@ fn log_ice_configuration(role: &'static str, selection: &IceServerSelection, stu
         ice_source = selection.source.as_str(),
         configured_servers = selection.server_count(),
         default_stun_appended = stun_added,
+        has_turn,
         "configuring WebRTC peer connection"
     );
 }
@@ -1009,6 +1099,9 @@ impl WebRtcTransport {
         let inbound_tx_for_handler = inbound_tx_raw.clone();
         tracing::debug!(target = "webrtc", transport_id = ?handler_id, "registering data channel handler");
         let encryption = Arc::new(EncryptionManager::new());
+        update_transport_diagnostics(handler_id, |entry| {
+            entry.channel_label = Some(dc.label().to_string());
+        });
         let encryption_clone_for_handler = Arc::clone(&encryption);
         let pending_encrypted = Arc::new(Mutex::new(VecDeque::new()));
         let pending_for_handler = Arc::clone(&pending_encrypted);
@@ -1016,14 +1109,24 @@ impl WebRtcTransport {
         let frame_reassembler =
             Arc::new(Mutex::new(framed::FramedDecoder::new(frame_config.clone())));
         let frame_reassembler_for_handler = Arc::clone(&frame_reassembler);
+        let dc_label_for_handler = dc.label().to_string();
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let sender = inbound_tx_for_handler.clone();
             let log_id = handler_id;
             let encryption = Arc::clone(&encryption_clone_for_handler);
             let pending = Arc::clone(&pending_for_handler);
             let frame_reassembler = Arc::clone(&frame_reassembler_for_handler);
+            let channel_label = dc_label_for_handler.clone();
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
+                tracing::debug!(
+                    target = "webrtc::datachannel",
+                    transport_id = ?log_id,
+                    channel = %channel_label,
+                    len = bytes.len(),
+                    preview = %hex_preview(&bytes),
+                    "data channel message received"
+                );
                 Self::handle_incoming_bytes(
                     &encryption,
                     &pending,
@@ -1040,7 +1143,16 @@ impl WebRtcTransport {
         dc.on_error(Box::new(move |err| {
             let log_id = handler_id;
             Box::pin(async move {
-                tracing::warn!(target = "webrtc", transport_id = ?log_id, error = %err, "data channel error");
+                let snapshot = transport_diagnostics(log_id);
+                tracing::warn!(
+                    target = "webrtc",
+                    transport_id = ?log_id,
+                    session_id = snapshot.as_ref().and_then(|d| d.session_id.as_deref()).unwrap_or(""),
+                    channel = snapshot.as_ref().and_then(|d| d.channel_label.as_deref()).unwrap_or(""),
+                    remote_peer = snapshot.as_ref().and_then(|d| d.remote_peer.as_deref()).unwrap_or(""),
+                    error = %err,
+                    "data channel error"
+                );
             })
         }));
         dc.on_close(Box::new(move || {
@@ -1050,11 +1162,14 @@ impl WebRtcTransport {
             Box::pin(async move {
                 let pc_state = pc_clone.connection_state();
                 let ice_state = pc_clone.ice_connection_state();
+                let snapshot = transport_diagnostics(log_id);
                 if let Some(flag) = handshake_for_close.as_ref() {
                     if !flag.load(Ordering::SeqCst) {
                         tracing::debug!(
 
                             transport_id = ?log_id,
+                            session_id = snapshot.as_ref().and_then(|d| d.session_id.as_deref()).unwrap_or(""),
+                            channel = snapshot.as_ref().and_then(|d| d.channel_label.as_deref()).unwrap_or(""),
                             pc_state = ?pc_state,
                             ice_state = ?ice_state,
                             "data channel closed before readiness handshake completed"
@@ -1065,6 +1180,8 @@ impl WebRtcTransport {
                 tracing::debug!(
 
                     transport_id = ?log_id,
+                    session_id = snapshot.as_ref().and_then(|d| d.session_id.as_deref()).unwrap_or(""),
+                    channel = snapshot.as_ref().and_then(|d| d.channel_label.as_deref()).unwrap_or(""),
                     pc_state = ?pc_state,
                     ice_state = ?ice_state,
                     "data channel closed"
@@ -1207,6 +1324,9 @@ impl WebRtcTransport {
                     state = "end",
                     buffered_before = before
                 );
+                if let Some(high) = record_buffered_amount(transport_id, before as u64) {
+                    log_buffered_high_water(transport_id, high, "before_send");
+                }
                 let budget = frame_config_for_sender.backpressure_budget();
                 let mut buffered = before as u64;
                 while buffered > budget {
@@ -1251,6 +1371,9 @@ impl WebRtcTransport {
                             state = "end",
                             buffered_after = after
                         );
+                        if let Some(high) = record_buffered_amount(transport_id, after as u64) {
+                            log_buffered_high_water(transport_id, high, "after_send");
+                        }
                         tracing::debug!(
 
                             transport_id = ?transport_id,
@@ -1380,6 +1503,12 @@ impl WebRtcTransport {
         log_id: TransportId,
         raw_mode: bool,
     ) {
+        tracing::debug!(
+            transport_id = ?log_id,
+            raw_mode,
+            len = bytes.len(),
+            "processing inbound datachannel message"
+        );
         if !encryption.is_enabled() && looks_like_encrypted_frame(&bytes) {
             let mut queue = pending.lock().unwrap();
             queue.push_back(bytes);
@@ -1411,7 +1540,14 @@ impl WebRtcTransport {
     ) {
         let payload = if encryption.is_enabled() {
             match encryption.decrypt(&bytes) {
-                Ok(plaintext) => plaintext,
+                Ok(plaintext) => {
+                    tracing::debug!(
+                        transport_id = ?log_id,
+                        decrypted_len = plaintext.len(),
+                        "decrypted inbound frame"
+                    );
+                    plaintext
+                }
                 Err(err) => {
                     tracing::warn!(
                         transport_id = ?log_id,
@@ -1457,6 +1593,23 @@ impl WebRtcTransport {
         raw_mode: bool,
     ) {
         framed::publish(log_id, frame.clone());
+        if frame.namespace == "controller" {
+            tracing::debug!(
+                transport_id = ?log_id,
+                kind = %frame.kind,
+                len = frame.payload.len(),
+                enc = encryption_enabled,
+                "published controller frame to framed bus"
+            );
+        } else if frame.namespace == "fastpath" {
+            tracing::debug!(
+                transport_id = ?log_id,
+                kind = %frame.kind,
+                len = frame.payload.len(),
+                enc = encryption_enabled,
+                "published fastpath frame to framed bus"
+            );
+        }
         if frame.namespace != "sync" {
             tracing::debug!(
                 transport_id = ?log_id,
@@ -2564,6 +2717,7 @@ async fn negotiate_offerer_peer(
                             peer_id = %peer_id_for_incoming,
                             ip = %meta.ip,
                             port = meta.port,
+                            candidate_type = %meta.candidate_type,
                             scope = meta.scope,
                             "decoded remote ICE candidate"
                         );
@@ -2841,30 +2995,6 @@ async fn negotiate_offerer_peer(
         return Ok(None);
     }
 
-    tracing::debug!(
-
-        peer_id = %peer.id,
-        %handshake_id,
-        label = %peer_label_for_logging,
-        "waiting for datachannel to open (15s timeout)"
-    );
-    if tokio::time::timeout(Duration::from_secs(15), dc_notify.notified())
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            %handshake_id,
-            label = %peer_label_for_logging,
-            peer_id = %peer.id,
-            "datachannel open timeout, closing peer connection"
-        );
-        let _ = pc.close().await;
-        ice_task.abort();
-        return Err(TransportError::Setup(
-            "offerer data channel did not open".into(),
-        ));
-    }
-
     let local_id = next_transport_id();
     let remote_id = next_transport_id();
     install_peer_connection_tracing(
@@ -2875,6 +3005,32 @@ async fn negotiate_offerer_peer(
         Some(peer.id.clone()),
         Some(local_id),
     );
+    tracing::debug!(
+
+        peer_id = %peer.id,
+        %handshake_id,
+        label = %peer_label_for_logging,
+        transport_id = ?local_id,
+        "waiting for datachannel to open (15s timeout)"
+    );
+    if tokio::time::timeout(Duration::from_secs(15), dc_notify.notified())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            %handshake_id,
+            label = %peer_label_for_logging,
+            peer_id = %peer.id,
+            transport_id = ?local_id,
+            "datachannel open timeout, closing peer connection"
+        );
+        let _ = pc.close().await;
+        ice_task.abort();
+        return Err(TransportError::Setup(
+            "offerer data channel did not open".into(),
+        ));
+    }
+
     let handshake_complete = Arc::new(AtomicBool::new(false));
     let dc_state_before = dc.ready_state();
     let pc_state_before = pc.connection_state();
@@ -3369,8 +3525,8 @@ async fn attach_and_rewrite_signaling_url(
             .unwrap_or("unknown"),
         peer_id = %body
             .get("peer_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown"),
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown"),
         url = %attach_url,
         "posting peer-sessions attach"
     );
@@ -3384,7 +3540,15 @@ async fn attach_and_rewrite_signaling_url(
         .json(&body)
         .send()
         .await
-        .map_err(http_error)?;
+        .map_err(|e| {
+            tracing::error!(
+                target = "negotiation",
+                "reqwest failed for url {}: {:?}",
+                attach_url,
+                e
+            );
+            http_error(e)
+        })?;
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "peer_attach",
@@ -3721,6 +3885,9 @@ async fn connect_answerer(
 
                     role = "offerer",
                     candidate = %cand.to_string(),
+                    candidate_type = %parse_candidate_info(&cand.to_string())
+                        .map(|info| info.candidate_type)
+                        .unwrap_or_else(|| "unknown".into()),
                     "local ice candidate gathered"
                 );
                 let handshake_key = match await_pre_shared_key(
@@ -4897,7 +5064,15 @@ impl ManagerJwtVerifier {
 
 fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {
     let full = format!("{}/{}", base.trim_end_matches('/'), suffix);
-    Url::parse(&full).map_err(|err| TransportError::Setup(err.to_string()))
+    Url::parse(&full).map_err(|err| {
+        tracing::error!(
+            target = "negotiation",
+            "endpoint parse failed for {}: {}",
+            full,
+            err
+        );
+        TransportError::Setup(err.to_string())
+    })
 }
 
 fn endpoint_with_params(
@@ -4945,7 +5120,15 @@ async fn post_sdp(
             result = ?send_attempt.as_ref().map(reqwest::Response::status),
             url = %url_string
         );
-        let response = send_attempt.map_err(http_error)?;
+        let response = send_attempt.map_err(|e| {
+            tracing::error!(
+                target = "negotiation",
+                "post_sdp reqwest failed for url {}: {:?}",
+                url_string,
+                e
+            );
+            http_error(e)
+        })?;
 
         if response.status().is_success() {
             metrics::WEBRTC_SIGNALING_RESULTS
@@ -5044,7 +5227,15 @@ async fn fetch_sdp(
         result = ?send_attempt.as_ref().map(reqwest::Response::status),
         url = %url_string
     );
-    let response = send_attempt.map_err(http_error)?;
+    let response = send_attempt.map_err(|e| {
+        tracing::error!(
+            target = "negotiation",
+            "fetch_sdp reqwest failed for url {}: {:?}",
+            url_string,
+            e
+        );
+        http_error(e)
+    })?;
 
     match response.status() {
         StatusCode::OK => {
@@ -6054,6 +6245,8 @@ struct PeerConnectionTraceContext {
     session_id: Option<String>,
     remote_peer: Option<String>,
     transport_id: Option<TransportId>,
+    last_local_candidate: Arc<Mutex<Option<String>>>,
+    last_remote_candidate: Arc<Mutex<Option<String>>>,
 }
 
 fn install_peer_connection_tracing(
@@ -6063,14 +6256,27 @@ fn install_peer_connection_tracing(
     session_id: Option<String>,
     remote_peer: Option<String>,
     transport_id: Option<TransportId>,
-) {
+) -> Arc<PeerConnectionTraceContext> {
     let context = Arc::new(PeerConnectionTraceContext {
         role,
         handshake_id,
         session_id,
         remote_peer,
         transport_id,
+        last_local_candidate: Arc::new(Mutex::new(None)),
+        last_remote_candidate: Arc::new(Mutex::new(None)),
     });
+    if let Some(tid) = transport_id {
+        let handshake = context.handshake_id.clone();
+        let session = context.session_id.clone();
+        let remote = context.remote_peer.clone();
+        update_transport_diagnostics(tid, |entry| {
+            entry.role = Some(role.to_string());
+            entry.handshake_id = handshake.clone();
+            entry.session_id = session.clone();
+            entry.remote_peer = remote.clone();
+        });
+    }
     let role_label = role.to_string();
 
     let peer_ctx = context.clone();
@@ -6088,6 +6294,12 @@ fn install_peer_connection_tracing(
                 new_state = ?state,
                 "peer connection state change"
             );
+            if let Some(tid) = ctx.transport_id {
+                let state_label = format!("{state:?}");
+                update_transport_diagnostics(tid, |entry| {
+                    entry.last_pc_state = Some(state_label.clone());
+                });
+            }
             if state == RTCPeerConnectionState::Failed {
                 metrics::WEBRTC_DTLS_FAILURES
                     .with_label_values(&[&role])
@@ -6110,6 +6322,32 @@ fn install_peer_connection_tracing(
                 new_state = ?state,
                 "peer connection ice connection state change"
             );
+            if let Some(tid) = ctx.transport_id {
+                let state_label = format!("{state:?}");
+                update_transport_diagnostics(tid, |entry| {
+                    entry.last_ice_state = Some(state_label.clone());
+                });
+            }
+            tracing::info!(
+                target = "beach::transport::webrtc",
+                role = ctx.role,
+                handshake_id = ctx.handshake_id.as_deref().unwrap_or(""),
+                session_id = ctx.session_id.as_deref().unwrap_or(""),
+                remote_peer = ctx.remote_peer.as_deref().unwrap_or(""),
+                transport_id = ?ctx.transport_id,
+                new_state = ?state,
+                last_local_candidate = ctx
+                    .last_local_candidate
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.clone()),
+                last_remote_candidate = ctx
+                    .last_remote_candidate
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.clone()),
+                "ice_connection_state"
+            );
         })
     }));
 
@@ -6130,7 +6368,7 @@ fn install_peer_connection_tracing(
         })
     }));
 
-    let gather_ctx = context;
+    let gather_ctx = context.clone();
     pc.on_ice_gathering_state_change(Box::new(move |state| {
         let ctx = gather_ctx.clone();
         Box::pin(async move {
@@ -6146,6 +6384,8 @@ fn install_peer_connection_tracing(
             );
         })
     }));
+
+    context
 }
 
 async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), TransportError> {

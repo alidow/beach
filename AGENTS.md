@@ -2,18 +2,20 @@
 
 This file captures repo-wide tips for coding agents (Codex, Claude, etc.).
 
-## Docker + direnv
+## Docker + env
 
-- The repo uses `.envrc` to populate WebRTC NAT hints (`BEACH_ICE_PUBLIC_IP` /
-  `BEACH_ICE_PUBLIC_HOST`). Docker Compose commands must run with direnv-loaded
-  env vars, otherwise `docker compose logs beach-manager` fails with
-  `required variable BEACH_ICE_PUBLIC_HOST is missing a value`.
-- One-time: run `direnv allow` in the repo root so the shell hook trusts
-  `.envrc`. See `docs/helpful-commands/direnv-setup.md` for details.
-- When executing Compose from scripts or non-interactive shells, prefix the
-  command with `direnv exec .`, e.g. `direnv exec . docker compose logs
-  beach-manager`. This mirrors how we resolved the error above and ensures
-  every agent gets the right env without manual exports.
+- We no longer use `direnv`. Source `.env` (or export the required vars) before running Docker Compose. Do not prefix commands with `direnv exec`.
+- Use a single session-server base: set `BEACH_SESSION_SERVER_BASE`
+  (default `http://api.beach.dev:4132`). Add `127.0.0.1 api.beach.dev` to
+  /etc/hosts; Compose maps `api.beach.dev` to the host gateway. Other
+  variables (`BEACH_SESSION_SERVER`, `BEACH_ROAD_URL`,
+  `BEACH_PUBLIC_SESSION_SERVER`, Vite/Next URLs) derive from the base; avoid
+  container-local names like `beach-road:4132`.
+- Do not prebuild binaries inside the dev Docker stack or test scripts. All
+  agents and demos must invoke `cargo run` inside containers so code changes
+  are picked up. The only exception is the remote SSH bootstrap feature of
+  `apps/beach`, which requires a pre-built binary; outside of that path,
+  prebuilds are forbidden.
 
 ## Auth north star
 
@@ -32,5 +34,8 @@ This file captures repo-wide tips for coding agents (Codex, Claude, etc.).
 
 ## Transport note
 
-- We no longer have a “fast-path” transport. Everything is WebRTC P2P (or HTTP fallback when needed), so ignore any legacy fast-path references you might find in older docs or logs.
+- The legacy “fast-path” transport is gone; everything is unified WebRTC P2P (or HTTP fallback when needed). Treat any “fast-path” references in old logs/docs as stale.
 - Manager ↔ host and browser ↔ host now speak the same single Beach WebRTC transport as any other client; there is no special controller channel or peer. If you see code branching for “fast path” peers/labels/hints, assume it should be deleted or folded into the primary transport.
+- The CLI host (`apps/beach`) should only understand “host” and “client” roles. Any awareness of Beach Manager, controllers, or mgr-actions state belongs in the harness (`crates/beach-buggy`). Hosts should attach the unified bridge and let beach-buggy consume/produce controller/state/health frames over the unified channel; do not add controller-specific data channel handling to the host.
+- Manager joins host sessions as a normal client via Beach Road signaling (wss) and talks to hosts only over the unified WebRTC channel. Do not add HTTP-based cache/state sync or extra data channels (e.g., `mgr-actions`/`mgr-acks`); everything must ride the unified transport.
+- Cache/state syncing between host ↔ manager or host ↔ browser must never use HTTP. Unified WebRTC + wss signaling only—no host-side HTTP pollers or publishers for cache/state.

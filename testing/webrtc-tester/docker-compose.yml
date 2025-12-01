@@ -1,0 +1,135 @@
+version: "3.9"
+
+name: beach-webrtc-tester
+
+networks:
+  webrtc-tester-net:
+    driver: bridge
+
+volumes:
+  webrtc-tester-cargo-target:
+  webrtc-tester-cargo-registry:
+  webrtc-tester-redis-data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: webrtc-tester-redis
+    restart: unless-stopped
+    networks:
+      - webrtc-tester-net
+    volumes:
+      - webrtc-tester-redis-data:/data
+
+  signaling:
+    image: rustlang/rust:nightly
+    container_name: webrtc-tester-signaling
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      BEACH_ROAD_PORT: ${BEACH_ROAD_PORT:-5232}
+      BEACH_SESSION_SERVER: http://signaling:5232
+      BEACH_PUBLIC_SESSION_SERVER: ${BEACH_PUBLIC_SESSION_SERVER:-http://localhost:5232}
+      RUST_LOG: ${SIGNALING_RUST_LOG:-info,beach_road::webrtc=debug}
+    command: >
+      bash -lc "export PATH=/usr/local/cargo/bin:$PATH && cd /workspace && cargo run -p beach-road"
+    depends_on:
+      - redis
+    ports:
+      - "5232:5232"
+    volumes:
+      - ../..:/workspace
+      - webrtc-tester-cargo-target:/workspace/target
+      - webrtc-tester-cargo-registry:/usr/local/cargo/registry
+    networks:
+      webrtc-tester-net:
+        aliases:
+          - signaling
+          - session-server
+          - api.beach.dev
+
+  host:
+    image: rustlang/rust:nightly
+    container_name: webrtc-tester-host
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER:-http://signaling:5232}
+      BEACH_ROAD_URL: ${BEACH_ROAD_URL:-http://signaling:5232}
+      BEACH_INSECURE_TRANSPORT: ${BEACH_INSECURE_TRANSPORT:-}
+      BEACH_PUBLIC_MODE: ${BEACH_PUBLIC_MODE:-1}
+      BEACH_ICE_PUBLIC_IP: ${BEACH_ICE_PUBLIC_IP:-}
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-}
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-62550}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-62650}
+      BEACH_ICE_SERVERS: ${BEACH_ICE_SERVERS:-}
+      BEACH_MANAGER_AUTH_OPTIONAL: 1
+      HOST_HANDSHAKE_PATH: /workspace/testing/webrtc-tester/results/host-handshake.json
+      HOST_STDOUT_LOG: /workspace/testing/webrtc-tester/results/host-stdout.log
+      HOST_STRUCTURED_LOG: /workspace/testing/webrtc-tester/results/host.log
+      HOST_SUMMARY_PATH: /workspace/testing/webrtc-tester/results/host-summary.json
+      HOST_PAYLOAD_PREFIX: ${HOST_PAYLOAD_PREFIX:-}
+      RUST_LOG: ${HOST_RUST_LOG:-webrtc::peer_connection=info,webrtc::ice_transport=info,beach::transport::webrtc=debug}
+    entrypoint: ["bash", "/workspace/testing/webrtc-tester/host/entrypoint.sh"]
+    depends_on:
+      - signaling
+    volumes:
+      - ../..:/workspace
+      - webrtc-tester-cargo-target:/workspace/target
+      - webrtc-tester-cargo-registry:/usr/local/cargo/registry
+    ports:
+      - "${BEACH_ICE_PORT_START:-62550}-${BEACH_ICE_PORT_END:-62650}:${BEACH_ICE_PORT_START:-62550}-${BEACH_ICE_PORT_END:-62650}/udp"
+    networks:
+      webrtc-tester-net:
+        aliases:
+          - host
+
+  internal-client:
+    image: rustlang/rust:nightly
+    container_name: webrtc-tester-internal-client
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      BEACH_PUBLIC_MODE: ${BEACH_PUBLIC_MODE:-1}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER:-http://signaling:5232}
+      BEACH_ROAD_URL: ${BEACH_ROAD_URL:-http://signaling:5232}
+      BEACH_INSECURE_TRANSPORT: ${BEACH_INSECURE_TRANSPORT:-}
+      BEACH_MANAGER_AUTH_OPTIONAL: 1
+      BEACH_TOKEN: ${BEACH_TOKEN:-}
+      CLIENT_PAYLOAD: ${CLIENT_PAYLOAD:-}
+      CLIENT_TIMEOUT: ${CLIENT_TIMEOUT:-45}
+      CLIENT_HOLD_SECS: ${CLIENT_HOLD_SECS:-0}
+      RUST_LOG: ${CLIENT_RUST_LOG:-webrtc::peer_connection=info,webrtc::ice_transport=info,beach::transport::webrtc=debug}
+    entrypoint: ["bash", "/workspace/testing/webrtc-tester/client/internal.sh"]
+    depends_on:
+      - host
+    volumes:
+      - ../..:/workspace
+      - webrtc-tester-cargo-target:/workspace/target
+      - webrtc-tester-cargo-registry:/usr/local/cargo/registry
+    networks:
+      webrtc-tester-net:
+        aliases:
+          - internal-client
+
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: webrtc-tester-turn
+    profiles:
+      - turn
+    command: >
+      turnserver -n --log-file stdout --realm=${TURN_REALM:-beach-webrtc-tester} --listening-port=${TURN_PORT:-5233} --fingerprint \
+        --lt-cred-mech --user=${TURN_USERNAME:-beach}:${TURN_PASSWORD:-beachtest} \
+        --external-ip=${TURN_EXTERNAL_IP:-127.0.0.1} --no-cli \
+        --min-port=${TURN_MIN_PORT:-62550} --max-port=${TURN_MAX_PORT:-62650}
+    ports:
+      - "${TURN_PORT:-5233}:${TURN_PORT:-5233}"
+      - "${TURN_PORT:-5233}:${TURN_PORT:-5233}/udp"
+    networks:
+      webrtc-tester-net:
+        aliases:
+          - turn

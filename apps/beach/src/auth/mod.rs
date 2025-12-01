@@ -85,6 +85,9 @@ pub fn is_public_mode() -> bool {
     if let Some(force) = env_bool("BEACH_PUBLIC_MODE") {
         return force;
     }
+    if env::var("BEACH_TOKEN").is_ok() {
+        return false;
+    }
     !has_valid_profile()
 }
 
@@ -127,6 +130,12 @@ pub async fn maybe_access_token(
     profile_override: Option<&str>,
     refresh_if_needed: bool,
 ) -> Result<Option<String>, AuthError> {
+    if let Ok(token) = env::var("BEACH_TOKEN") {
+        if !token.trim().is_empty() {
+            return Ok(Some(token));
+        }
+    }
+
     let profile_name = match active_profile_name(profile_override) {
         Ok(name) => name,
         Err(AuthError::NotLoggedIn) | Err(AuthError::ProfileNotFound(_)) => return Ok(None),
@@ -406,6 +415,19 @@ pub async fn resolve_turn_credentials(
     profile_override: Option<&str>,
 ) -> Result<TurnCredentialsResponse, AuthError> {
     let config = AuthConfig::from_env()?;
+
+    println!("DEBUG: resolve_turn_credentials called");
+    if let Ok(token) = env::var("BEACH_TOKEN") {
+        println!("DEBUG: BEACH_TOKEN found (len={})", token.len());
+        if !token.trim().is_empty() {
+            println!("DEBUG: using BEACH_TOKEN from env");
+            let client = BeachGateClient::new(config.clone())?;
+            return client.turn_credentials(&token).await;
+        }
+    } else {
+        println!("DEBUG: BEACH_TOKEN not found in env");
+    }
+
     let profile_name = active_profile_name(profile_override)?;
     let mut store = load_store()?;
     let profile = store

@@ -73,6 +73,35 @@ impl SignalingState {
         state
     }
 
+    pub fn peers_for_session(&self, session_id: &str) -> Vec<PeerInfo> {
+        let mut out = Vec::new();
+        if let Some(peers) = self.sessions.get(session_id) {
+            for peer_entry in peers.iter() {
+                let peer = peer_entry.value();
+                let mut metadata = HashMap::new();
+                if let Some(label) = peer.label.clone() {
+                    metadata.insert("label".to_string(), label);
+                }
+                if let Some(addr) = peer.remote_addr {
+                    metadata.insert("remote_addr".to_string(), addr.to_string());
+                }
+                out.push(PeerInfo {
+                    id: peer.peer_id.clone(),
+                    role: peer.role.clone(),
+                    joined_at: 0,
+                    supported_transports: peer.supported_transports.clone(),
+                    preferred_transport: peer.preferred_transport.clone(),
+                    metadata: if metadata.is_empty() {
+                        None
+                    } else {
+                        Some(metadata)
+                    },
+                });
+            }
+        }
+        out
+    }
+
     /// Monitor heartbeats and clean up stale connections
     async fn monitor_heartbeats(&self) {
         let mut interval = tokio::time::interval(self.heartbeat_check_interval);

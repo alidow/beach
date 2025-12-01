@@ -5,6 +5,7 @@ import {
   connectWebRtcTransport,
   type ConnectedWebRtcTransport,
 } from '../transport/webrtc';
+import { maybeParseIceServers } from '../transport/webrtcIceConfig';
 
 export interface ConnectUnifiedOptions {
   sessionId: string;
@@ -45,12 +46,19 @@ export async function connectUnified(options: ConnectUnifiedOptions): Promise<Un
     label: options.clientLabel,
   });
 
+  const iceServers =
+    join.iceServers !== undefined
+      ? join.iceServers
+      : options.iceServers !== undefined
+        ? options.iceServers
+        : maybeParseIceServers() ?? undefined;
+
   const webrtc = await connectWebRtcTransport({
     signaling,
     signalingUrl: join.signalingUrl,
     role: join.role,
     pollIntervalMs: join.pollIntervalMs,
-    iceServers: options.iceServers,
+    iceServers,
     logger: options.logger,
     passphrase: options.passcode,
     viewerToken: options.viewerToken,
@@ -120,11 +128,49 @@ function normaliseBase(input: string): URL {
   return url;
 }
 
+function normalizeIceServers(raw?: unknown): RTCIceServer[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized = raw
+    .map((server) => {
+      if (!server || typeof server !== 'object') {
+        return null;
+      }
+      const urlsRaw = (server as any).urls;
+      const urls =
+        typeof urlsRaw === 'string'
+          ? urlsRaw.split(',').map((u) => u.trim()).filter(Boolean)
+          : Array.isArray(urlsRaw)
+            ? urlsRaw.map((u) => (typeof u === 'string' ? u.trim() : '')).filter(Boolean)
+            : [];
+      if (urls.length === 0) {
+        return null;
+      }
+      const candidate: RTCIceServer = { urls };
+      if (typeof (server as any).username === 'string' && (server as any).username.trim().length > 0) {
+        candidate.username = (server as any).username.trim();
+      }
+      if (
+        typeof (server as any).credential === 'string' &&
+        (server as any).credential.trim().length > 0
+      ) {
+        candidate.credential = (server as any).credential.trim();
+      }
+      return candidate;
+    })
+    .filter((server): server is RTCIceServer => Boolean(server));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 async function fetchJoinMetadataUnified(options: ConnectUnifiedOptions): Promise<{
   signalingUrl: string;
   websocketUrl?: string;
   role: 'offerer' | 'answerer';
   pollIntervalMs: number;
+  iceServers?: RTCIceServer[];
+  iceServersExpiresAtMs?: number;
+  raw: JoinSessionResponse;
 }> {
   const url = `${options.baseUrl.replace(/\/$/, '')}/sessions/${options.sessionId}/join`;
   const response = await fetch(url, {
@@ -159,12 +205,22 @@ async function fetchJoinMetadataUnified(options: ConnectUnifiedOptions): Promise
       : typeof offerMetadata.pollIntervalMs === 'number'
         ? offerMetadata.pollIntervalMs
         : 250;
+  const iceServers = normalizeIceServers(payload.ice_servers ?? payload.iceServers);
+  const iceServersExpiresAtMs =
+    typeof payload.ice_servers_expires_at_ms === 'number'
+      ? payload.ice_servers_expires_at_ms
+      : typeof payload.iceServersExpiresAtMs === 'number'
+        ? payload.iceServersExpiresAtMs
+        : undefined;
 
   return {
     signalingUrl,
     websocketUrl: payload.websocket_url ?? undefined,
     role,
     pollIntervalMs,
+    iceServers,
+    iceServersExpiresAtMs,
+    raw: payload,
   };
 }
 
@@ -183,4 +239,10 @@ interface JoinSessionResponse {
   webrtc_offer?: OfferMetadata;
   transports?: Array<{ kind: string; metadata?: OfferMetadata }>;
   websocket_url?: string;
+  // eslint-disable-next-line @typescript-eslint/naming-convention
+  ice_servers?: RTCIceServer[];
+  // eslint-disable-next-line @typescript-eslint/naming-convention
+  ice_servers_expires_at_ms?: number;
+  iceServers?: RTCIceServer[];
+  iceServersExpiresAtMs?: number;
 }

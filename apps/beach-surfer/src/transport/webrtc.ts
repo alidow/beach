@@ -19,14 +19,12 @@ import {
   type BrowserHandshakeResult,
   type BrowserHandshakeRole,
 } from './crypto/noiseHandshake';
-import {
-  SecureDataChannel,
-  type DataChannelLike,
-} from './crypto/secureDataChannel';
+import { SecureDataChannel, type DataChannelLike } from './crypto/secureDataChannel';
 import type { SignalingClient, ServerMessage } from './signaling';
 import { generatePeerId } from './signaling';
 import { reportSecureTransportEvent } from '../lib/telemetry';
 import type { ConnectionTrace } from '../lib/connectionTrace';
+import { maybeParseIceServers, maybeParseIceTransportPolicy } from './webrtcIceConfig';
 
 type ViewerRtcEventPayload = {
   sessionId: string;
@@ -476,11 +474,13 @@ export async function connectWebRtcTransport(
     log(logger, `transport negotiation proposal failed: ${String(error)}`);
   }
 
+  const envIceServers = maybeParseIceServers();
   const pc = new RTCPeerConnection({
     iceServers:
       options.iceServers && options.iceServers.length > 0
         ? options.iceServers
-        : [{ urls: 'stun:stun.l.google.com:19302' }],
+        : envIceServers ?? [{ urls: 'stun:stun.l.google.com:19302' }],
+    iceTransportPolicy: maybeParseIceTransportPolicy(),
   });
   const emitRtcState = (
     event: string,
@@ -1051,10 +1051,20 @@ async function connectAsAnswerer(options: {
       : secure.enabled
         ? secure.ensureKey(handshakeId)
         : undefined;
+  const localChannel =
+    options.role === 'offerer'
+      ? (() => {
+          const dc = pc.createDataChannel('beach', { ordered: true });
+          log(logger, 'created primary data channel (offerer)');
+          return dc;
+        })()
+      : undefined;
+
   const channelPromise = waitForDataChannel(pc, {
     remotePeerId,
     logger,
     peerSessionId: options.peerSessionId,
+    localChannel,
     handshake: secure.enabled
       ? {
           role: 'responder',
@@ -1123,6 +1133,7 @@ async function waitForDataChannel(
   options: {
     remotePeerId: string;
     logger?: (message: string) => void;
+    localChannel?: RTCDataChannel;
     handshake?: HandshakeOptions;
     telemetryBaseUrl?: string;
     sessionId?: string;
@@ -1316,6 +1327,10 @@ async function waitForDataChannel(
 
       void prepare();
     };
+
+    if (options.localChannel) {
+      handleDataChannel({ channel: options.localChannel } as RTCDataChannelEvent);
+    }
 
     pc.addEventListener('datachannel', handleDataChannel);
   });

@@ -1,3 +1,7 @@
+x-dev-extra-hosts: &dev_extra_hosts
+  - "host.docker.internal:host-gateway"
+  - "api.beach.dev:host-gateway"
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -13,7 +17,7 @@ services:
     networks:
       - beach-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -28,8 +32,7 @@ services:
     networks:
       - beach-network
   beach-manager:
-    platform: linux/amd64
-    image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
+    image: rustlang/rust:nightly
     container_name: beach-manager
     working_dir: /app
     env_file:
@@ -39,36 +42,37 @@ services:
       - bash
       - -lc
       - |
+        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-127.0.0.1}
         : > /var/log/beach-manager/beach-manager.log
         exec /app/scripts/docker/beach-manager-entry.sh cargo run -p beach-manager
     environment:
       DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
       REDIS_URL: redis://beach-redis:6379
-      AUTH_BYPASS: "0"
-      DEV_ALLOW_INSECURE_MANAGER_TOKEN: ${DEV_ALLOW_INSECURE_MANAGER_TOKEN:-0}
-      DEV_MANAGER_INSECURE_TOKEN: ${DEV_MANAGER_INSECURE_TOKEN:-}
-      BEACH_ROAD_URL: http://beach-road:4132
+      AUTH_BYPASS: "1"
+      DEV_ALLOW_INSECURE_MANAGER_TOKEN: 1
+      DEV_MANAGER_INSECURE_TOKEN: DEV-MANAGER-TOKEN
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
       PUBLIC_MANAGER_URL: http://127.0.0.1:8080
       BEACH_GATE_URL: http://beach-gate:4133
       BEACH_GATE_JWKS_URL: http://beach-gate:4133/.well-known/jwks.json
       BEACH_GATE_ISSUER: beach-gate
       BEACH_GATE_AUDIENCE: private-beach-manager
       BEACH_GATE_SIGNING_KID_PATH: /secrets/beach-gate-signing.kid
-      BEACH_ICE_PUBLIC_IP: ${BEACH_ICE_PUBLIC_IP:?Set BEACH_ICE_PUBLIC_IP (run direnv allow). See docs/helpful-commands/direnv-setup.md}
-      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:?Set BEACH_ICE_PUBLIC_HOST (run direnv allow). See docs/helpful-commands/direnv-setup.md}
-      CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
-      CLERK_ISSUER: ${CLERK_ISSUER:-}
-      CLERK_AUDIENCE: ${CLERK_AUDIENCE:-}
-      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER:-http://localhost:4132}
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-host.docker.internal}
+      # CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
+      # CLERK_ISSUER: ${CLERK_ISSUER:-}
+      # CLERK_AUDIENCE: ${CLERK_AUDIENCE:-}
       STDOUT_LOG: ${BEACH_MANAGER_STDOUT_LOG:-info}
       BEACH_MANAGER_FILE_LOG: ${BEACH_MANAGER_FILE_LOG:-info,beach_manager=trace}
       LOG_PATH: /var/log/beach-manager/beach-manager.log
       # Optional: override the ICE port range when you need something other than 62000-62100.
-      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-62000}
-      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-62100}
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-64000}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-64100}
       RUST_LOG: info,controller=debug,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace
       PRIVATE_BEACH_MANAGER_TOKEN: ${PRIVATE_BEACH_MANAGER_TOKEN:-}
-      PRIVATE_BEACH_BYPASS_AUTH: ${PRIVATE_BEACH_BYPASS_AUTH:-0}
+      PRIVATE_BEACH_BYPASS_AUTH: ${PRIVATE_BEACH_BYPASS_AUTH:-1}
     volumes:
       - .:/app
       - ./config/dev-secrets:/secrets:ro
@@ -86,22 +90,30 @@ services:
       - "8080:8080"
       # Publish a small UDP port range for ICE. Keep this in sync with
       # BEACH_ICE_PORT_START/END above.
-      - "62000-62100:62000-62100/udp"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "64000-64100:64000-64100/udp"
+    extra_hosts: *dev_extra_hosts
     networks:
-      - beach-network
+      beach-network:
+        ipv4_address: 172.28.0.100
   beach-road:
-    platform: linux/amd64
-    image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
+    image: rustlang/rust:nightly
     container_name: beach-road
     working_dir: /app
-    command: ["cargo", "run", "-p", "beach-road"]
+    command:
+      - bash
+      - -lc
+      - |
+        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-127.0.0.1}
+        exec /usr/local/cargo/bin/cargo run -p beach-road
     environment:
       REDIS_URL: redis://beach-redis:6379
-      BEACH_SESSION_SERVER: http://beach-road:4132
-      BEACH_PUBLIC_SESSION_SERVER: http://host.docker.internal:4132
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      BEACH_PUBLIC_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
       BEACH_ROAD_PORT: 4132
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-127.0.0.1}
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-64000}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-64100}
       RUST_LOG: info,beach_road::heartbeat=debug,beach_road::webrtc=debug
     volumes:
       - .:/app
@@ -112,6 +124,7 @@ services:
         condition: service_started
     ports:
       - "4132:4132"
+    extra_hosts: *dev_extra_hosts
     networks:
       - beach-network
   beach-surfer:
@@ -120,7 +133,9 @@ services:
     working_dir: /app/apps/beach-surfer
     command: sh -c "rm -f package-lock.json && npm install --force && npm run dev -- --host"
     environment:
-      VITE_SESSION_SERVER_URL: http://localhost:4132
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      VITE_SESSION_SERVER_URL: ${VITE_SESSION_SERVER_URL:-${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}}
+      NEXT_PUBLIC_FORCE_TURN: ${NEXT_PUBLIC_FORCE_TURN:-0}
     volumes:
       - .:/app
       - beach-surfer-node-modules:/app/apps/beach-surfer/node_modules
@@ -128,6 +143,7 @@ services:
       - beach-road
     ports:
       - "5173:5173"
+    extra_hosts: *dev_extra_hosts
     networks:
       - beach-network
   beach-gate:
@@ -148,13 +164,19 @@ services:
       BEACH_GATE_DEFAULT_ENTITLEMENTS: "rescue:fallback,private-beach:turn,pb:beaches.read,pb:beaches.write,pb:sessions.read,pb:sessions.write,pb:control.read,pb:control.write,pb:control.consume,pb:agents.onboard,pb:harness.publish"
       BEACH_GATE_SIGNING_KEY_PATH: /secrets/beach-gate-ec256.pem
       BEACH_GATE_SIGNING_KID_PATH: /secrets/beach-gate-signing.kid
+      BEACH_GATE_TURN_URLS: ${BEACH_GATE_TURN_URLS:-turn:${BEACH_TURN_EXTERNAL_IP:-127.0.0.1}:3478,turn:beach-coturn:3478}
+      BEACH_GATE_TURN_SECRET: beach-dev-turn-secret
+      BEACH_GATE_TURN_TTL: 86400
+      BEACH_GATE_TURN_REALM: turn.private-beach.test
+      BEACH_GATE_TURN_REQUIRED_ENTITLEMENTS: private-beach:turn
     volumes:
       - .:/app
       - ./config/dev-secrets:/secrets
     ports:
       - "4133:4133"
+    extra_hosts: *dev_extra_hosts
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:4133/.well-known/jwks.json >/dev/null"]
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:4133/.well-known/jwks.json >/dev/null" ]
       interval: 10s
       timeout: 3s
       retries: 30
@@ -169,15 +191,22 @@ services:
     environment:
       NEXT_PUBLIC_PRIVATE_BEACH_REWRITE_ENABLED: "1"
       NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_URL: http://localhost:8080
-      NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN: ${NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN:-}
-      NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL: http://localhost:4132
-      PRIVATE_BEACH_ROAD_URL: http://beach-road:4132
+      NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN: DEV-MANAGER-TOKEN
+      NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
+      NEXT_PUBLIC_FORCE_TURN: ${NEXT_PUBLIC_FORCE_TURN:-0}
+      PRIVATE_BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.dev:4132}
       PRIVATE_BEACH_MANAGER_URL: http://beach-manager:8080
-      PRIVATE_BEACH_MANAGER_TOKEN: ${PRIVATE_BEACH_MANAGER_TOKEN:-}
+      PRIVATE_BEACH_MANAGER_TOKEN: DEV-MANAGER-TOKEN
       PRIVATE_BEACH_GATE_URL: http://beach-gate:4133
       NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE: ${NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE:-}
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
       CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+      # Explicit ICE config for the dashboard: prefer TURN and optionally disable the Google STUN fallback.
+      NEXT_PUBLIC_TURN_URLS: ${NEXT_PUBLIC_TURN_URLS:-turn:beach-coturn:3478?transport=udp}
+      NEXT_PUBLIC_TURN_USERNAME: ${NEXT_PUBLIC_TURN_USERNAME:-}
+      NEXT_PUBLIC_TURN_PASSWORD: ${NEXT_PUBLIC_TURN_PASSWORD:-}
+      NEXT_PUBLIC_DISABLE_DEFAULT_STUN: ${NEXT_PUBLIC_DISABLE_DEFAULT_STUN:-1}
+      NEXT_PUBLIC_ICE_SERVERS: ${NEXT_PUBLIC_ICE_SERVERS:-}
       BEACH_TEST_MODE: ${BEACH_TEST_MODE:-true}
       TAILWIND_MODE: watch
       CHOKIDAR_USEPOLLING: "true"
@@ -193,6 +222,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "3003:3003"
+    extra_hosts: *dev_extra_hosts
     networks:
       - beach-network
   private-beach-migrate:
@@ -205,13 +235,7 @@ services:
     depends_on:
       db-migrate:
         condition: service_completed_successfully
-    entrypoint: ["sh", "-c", "set -e; \
-      until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready for surfer'; \
-      for f in /drizzle/*.sql; do \
-        echo 'applying surfer migration' $$f; \
-        psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d private_beach_surfer -f $$f; \
-      done; \
-      echo 'surfer migrations applied' "]
+    entrypoint: [ "sh", "-c", "set -e; until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready for surfer'; for f in /drizzle/*.sql; do echo 'applying surfer migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d private_beach_surfer -f $$f; done; echo 'surfer migrations applied' " ]
     networks:
       - beach-network
   db-migrate:
@@ -224,19 +248,7 @@ services:
       PGPASSWORD: postgres
     volumes:
       - ./apps/beach-manager/migrations:/migrations:ro
-    entrypoint: ["sh", "-c", "set -e; \
-      until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready'; \
-      psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";'; \
-      psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS citext;'; \
-      if ! psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'private_beach_surfer'\" -h beach-postgres -U postgres -d postgres | grep -q 1; then \
-        echo 'creating database private_beach_surfer'; \
-        psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d postgres -c 'CREATE DATABASE private_beach_surfer'; \
-      fi; \
-      if psql -tAc \"SELECT to_regclass('session') IS NOT NULL\" -h beach-postgres -U postgres -d beach_manager | grep -q 't'; then \
-        echo 'migrations already present; skipping raw apply'; exit 0; \
-      fi; \
-      for f in /migrations/*.sql; do echo 'applying migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f $$f; done; \
-      echo 'migrations applied' "]
+    entrypoint: [ "sh", "-c", "set -e; until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS citext;'; if ! psql -tAc \"SELECT 1 FROM pg_database WHERE datname = 'private_beach_surfer'\" -h beach-postgres -U postgres -d postgres | grep -q 1; then echo 'creating database private_beach_surfer'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d postgres -c 'CREATE DATABASE private_beach_surfer'; fi; if psql -tAc \"SELECT to_regclass('session') IS NOT NULL\" -h beach-postgres -U postgres -d beach_manager | grep -q 't'; then echo 'migrations already present; skipping raw apply'; exit 0; fi; for f in /migrations/*.sql; do echo 'applying migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f $$f; done; echo 'migrations applied' " ]
     networks:
       - beach-network
   db-seed:
@@ -249,7 +261,7 @@ services:
       PGPASSWORD: postgres
     volumes:
       - ./config/dev-seed.sql:/seed/dev-seed.sql:ro
-    entrypoint: ["sh", "-c", "set -e; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f /seed/dev-seed.sql && echo 'seeded'"]
+    entrypoint: [ "sh", "-c", "set -e; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f /seed/dev-seed.sql && echo 'seeded'" ]
     networks:
       - beach-network
   coturn:
@@ -261,21 +273,25 @@ services:
       - /etc/coturn/turnserver.conf
       - --log-file
       - stdout
+      - --external-ip
+      - ${BEACH_TURN_EXTERNAL_IP}
     ports:
       - "3478:3478"
       - "3478:3478/udp"
       - "5349:5349"
       - "5349:5349/udp"
+      - "63000-63100:63000-63100/udp"
     volumes:
       - ./config/coturn/dev-turnserver.conf:/etc/coturn/turnserver.conf:ro
     networks:
-      - beach-network
+      beach-network:
+        ipv4_address: 172.28.0.101
   beach-lifeguard:
     image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
     container_name: beach-lifeguard
-    profiles: ["lifeguard"]
+    profiles: [ "lifeguard" ]
     working_dir: /app
-    command: ["cargo", "run", "-p", "beach-lifeguard-server"]
+    command: [ "cargo", "run", "-p", "beach-lifeguard-server" ]
     environment:
       BEACH_LIFEGUARD_REDIS_URL: redis://beach-redis:6379
       BEACH_LIFEGUARD_DISABLE_OIDC: "1"
@@ -298,6 +314,10 @@ volumes:
   cargo-registry-beach-lifeguard:
   beach-surfer-node-modules:
 
+
 networks:
   beach-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

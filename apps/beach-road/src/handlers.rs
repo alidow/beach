@@ -25,7 +25,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use crate::{
     entitlement::{EntitlementError, EntitlementVerifier},
     session::{generate_session_id, hash_passphrase, verify_passphrase},
-    signaling::WebRtcSdpPayload,
+    signaling::{PeerInfo, WebRtcSdpPayload},
     storage::{ControlMessage, PeerSessionInfo, SessionInfo, Storage},
     viewer_token::{ViewerTokenError, ViewerTokenVerifier},
     websocket::SignalingState,
@@ -939,6 +939,17 @@ pub async fn get_webrtc_answer(
             Err(StatusCode::CONFLICT)
         }
     }
+}
+
+pub async fn debug_session_peers(
+    Extension(signaling): Extension<SignalingState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Vec<PeerInfo>>, StatusCode> {
+    let peers = signaling.peers_for_session(&session_id);
+    if peers.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(peers))
 }
 
 /// GET /sessions/{id} - Check if session exists

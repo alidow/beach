@@ -50,13 +50,13 @@ use crate::transport::unified_bridge::UnifiedBuggyTransport;
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
-    CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport,
+    CellStylePayload, CursorPosition, HarnessError, HttpTransport, ManagerTransport,
     PairingTransportKind, StateDiff, StaticTokenProvider, StyleDefinition, StyledCell,
     TerminalFrame,
 };
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use reqwest::StatusCode;
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
@@ -72,7 +72,7 @@ use tokio::sync::{
     oneshot, watch,
 };
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{sleep, timeout};
 use tracing::field::display;
 use tracing::{Level, debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor, WebRtcChannels};
@@ -80,12 +80,14 @@ use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor, WebRtcC
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
+pub(crate) const MANAGER_CHANNEL_LABEL: &str = "beach-manager";
 pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
 pub(crate) const CONTROLLER_ACK_CHANNEL_LABEL: &str = "mgr-acks";
 pub(crate) const CONTROLLER_STATE_CHANNEL_LABEL: &str = "mgr-state";
 const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
+const DEFAULT_IDLE_SNAPSHOT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const HTTP_STATE_STREAM_INTERVAL_MS: u64 = 200;
 const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
@@ -195,6 +197,14 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         std::env::set_var("BEACH_SESSION_ID", &session_id);
     }
     let attach_state = Arc::new(ControllerAttachState::new());
+    if std::env::var("BEACH_MANAGER_AUTH_OPTIONAL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        // In public/manager-optional mode, do not block terminal/control channels on manager attach.
+        attach_state.mark_attached();
+        debug!(session_id = %session_id, "controller attach auto-satisfied (manager optional)");
+    }
     let controller_ctx = Arc::new(ControllerActionContext::new(
         session_id.clone(),
         attach_state.clone(),
@@ -258,11 +268,18 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let session_handle = hosted.handle().clone();
     let transport_hints = Arc::new(AsyncRwLock::new(session_handle.transport_hints().clone()));
     let fast_path_state_channel = Arc::new(FastPathStateChannel::default());
-    let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
-    let unified_manager = UnifiedManagerHandle::new(
-        manager_supports_extensions(session_handle.transport_hints()),
-        false,
-    );
+    let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints())
+        .or_else(|| {
+            let fallback = Duration::from_millis(DEFAULT_IDLE_SNAPSHOT_INTERVAL_MS);
+            info!(
+                target = "private_beach.state",
+                session_id = %session_id,
+                interval_ms = fallback.as_millis(),
+                "no idle snapshot hint provided; enabling fallback interval"
+            );
+            Some(fallback)
+        });
+    let unified_manager = UnifiedManagerHandle::new(true, false);
     let hint_keys: Vec<String> = session_handle.transport_hints().keys().cloned().collect();
     info!(
         target = "transport.extension",
@@ -343,42 +360,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             }
         });
 
-    let mut controller_bridge: Option<Arc<ControllerBridge>> = None;
-    let mut controller_manager_token: Option<String> = None;
-    if let Some(manager_url) = manager_url_for_actions.as_ref() {
-        let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let token = if let Some(token) = env_token {
-            Some(token)
-        } else {
-            auth::maybe_access_token(None, auth::manager_requires_access_token(manager_url))
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(bearer) = token {
-            controller_manager_token = Some(bearer.clone());
-            match ControllerBridge::new(
-                session_id.clone(),
-                controller_ctx.clone(),
-                manager_url.clone(),
-                bearer,
-            ) {
-                Ok(bridge) => controller_bridge = Some(Arc::new(bridge)),
-                Err(err) => {
-                    warn!(
-                        target = "controller.actions",
-                        session_id = %session_id,
-                        manager = %manager_url,
-                        error = %err,
-                        "controller bridge initialization failed"
-                    );
-                }
-            }
-        }
-    }
+    let controller_bridge: Option<Arc<ControllerBridge>> = None;
 
     let publish_bearer = parse_idle_publish_bearer(session_handle.transport_hints())
         .or_else(|| access_token.clone());
@@ -415,6 +397,22 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Arc::clone(&last_terminal_update),
         unified_manager.clone(),
     ));
+    // Push an initial snapshot immediately so downstream consumers (agent/viewer)
+    // receive a usable frame even before any terminal output occurs.
+    http_state_streamer.maybe_publish(false).await;
+    {
+        let attach_state = attach_state.clone();
+        let http_state_streamer = http_state_streamer.clone();
+        tokio::spawn(async move {
+            attach_state.wait_for_attach().await;
+            trace!(
+                target = "private_beach.state",
+                session_id = %http_state_streamer.controller.session_id(),
+                "controller attached; publishing state snapshot"
+            );
+            http_state_streamer.maybe_publish(true).await;
+        });
+    }
 
     let updates_forward_task = {
         let mut updates = updates;
@@ -427,7 +425,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                     *cursor_tracker.lock().unwrap() = Some(*cursor);
                 }
                 last_terminal_update.store(now_millis(), Ordering::Relaxed);
-                http_state_streamer.maybe_publish().await;
+                http_state_streamer.maybe_publish(false).await;
                 if forwarder_updates_tx.send(update).is_err() {
                     break;
                 }
@@ -494,255 +492,12 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     info!(session_id = %session_id, "host ready");
 
-    // Control listener: poll Beach Road for control messages (manager handshake/detach)
-    {
-        let road_base_url = normalized_base.clone();
-        let poll_session_id = session_id.clone();
-        let poll_join_code = join_code.clone();
-        let writer_for_actions = writer.clone();
-        let controller_ctx_for_actions = controller_ctx.clone();
-        let attach_state_for_actions = attach_state.clone();
-        let idle_snapshots_for_actions = idle_snapshot_controller.clone();
-        let transport_hints_for_actions = transport_hints.clone();
-        let fast_path_bearer_for_actions = controller_manager_token.clone();
-        tokio::spawn(async move {
-            let http = match Client::builder().build() {
-                Ok(c) => c,
-                Err(err) => {
-                    warn!(target = "controller.actions", error = %err, "failed to init http client for control poll");
-                    return;
-                }
-            };
-            let mut consumer_started = false;
-            let mut consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
-            let mut poll_connected = false;
-            loop {
-                let url = format!(
-                    "{}/sessions/{}/control/poll",
-                    road_base_url.trim_end_matches('/'),
-                    poll_session_id
-                );
-                let resp = http
-                    .post(&url)
-                    .json(&json!({ "code": poll_join_code }))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(resp) if resp.status().is_success() => {
-                        if !poll_connected {
-                            info!(
-                                target = "controller.actions",
-                                session_id = %poll_session_id,
-                                url = %url,
-                                "control poll connected"
-                            );
-                            poll_connected = true;
-                        }
-                        let body: serde_json::Value = match resp.json().await {
-                            Ok(v) => v,
-                            Err(err) => {
-                                warn!(target = "controller.actions", error = %err, "invalid control poll payload");
-                                sleep(Duration::from_millis(500)).await;
-                                continue;
-                            }
-                        };
-                        if let Some(list) = body.get("messages").and_then(|v| v.as_array()) {
-                            for item in list {
-                                let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                                let control_id =
-                                    item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                if kind == "manager_handshake" {
-                                    info!(
-                                        target = "controller.handshake.received",
-                                        session_id = %poll_session_id,
-                                        control_id = %control_id,
-                                        "manager handshake control message received"
-                                    );
-                                    if let Some(payload) = item.get("payload") {
-                                        // Extract any per-session publish token up front so it
-                                        // can be reused for both idle snapshots and auto-attach.
-                                        let mut publish_token_for_session: Option<String> = None;
-                                        if let Some(token_hint) =
-                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
-                                        {
-                                            if let Some(tok) = parse_publish_token_value(token_hint)
-                                            {
-                                                publish_token_for_session = Some(tok);
-                                            }
-                                        }
-                                        let manager_url = payload
-                                            .get("manager_url")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let controller_token = payload
-                                            .get("controller_token")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        if !manager_url.is_empty() {
-                                            idle_snapshots_for_actions
-                                                .update_base_url(manager_url.clone())
-                                                .await;
-                                        }
-                                        if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY)
-                                        {
-                                            let (interval, token) =
-                                                parse_idle_snapshot_payload(idle_hint);
-                                            if token.is_some()
-                                                && publish_token_for_session.is_none()
-                                            {
-                                                publish_token_for_session = token.clone();
-                                            }
-                                            if let Some(tok) = token {
-                                                idle_snapshots_for_actions
-                                                    .set_token(Some(tok))
-                                                    .await;
-                                            }
-                                            idle_snapshots_for_actions.apply_hint(interval).await;
-                                        }
-                                        if let Some(tok) = publish_token_for_session.as_ref() {
-                                            idle_snapshots_for_actions
-                                                .set_token(Some(tok.clone()))
-                                                .await;
-                                        }
-                                        if !consumer_started
-                                            && !manager_url.is_empty()
-                                            && !controller_token.is_empty()
-                                        {
-                                            info!(
-                                                target = "controller.handshake",
-                                                session_id = %poll_session_id,
-                                                manager = %manager_url,
-                                                "manager handshake received; starting action consumer"
-                                            );
-                                            let auth = ManagerActionAuth::ControllerToken(
-                                                controller_token.clone(),
-                                            );
-                                            consumer_handle = spawn_action_consumer(
-                                                controller_ctx_for_actions.clone(),
-                                                manager_url.clone(),
-                                                auth,
-                                                writer_for_actions.clone(),
-                                                transport_hints_for_actions.clone(),
-                                                publish_token_for_session
-                                                    .clone()
-                                                    .or(fast_path_bearer_for_actions.clone()),
-                                            );
-                                            consumer_started = true;
-                                        }
-                                        if let Some(fast_path_hint) =
-                                            payload.get("fast_path_webrtc").cloned()
-                                        {
-                                            idle_snapshots_for_actions
-                                                .update_fast_path_hint(fast_path_hint)
-                                                .await;
-                                        }
-                                        if let Some(auto_hint_value) =
-                                            payload.get("controller_auto_attach")
-                                        {
-                                            match parse_auto_attach_hint_value(auto_hint_value) {
-                                                Ok(auto_hint) => {
-                                                    info!(
-                                                        target = "controller.handshake.attach",
-                                                        session_id = %poll_session_id,
-                                                        private_beach_id = %auto_hint.private_beach_id,
-                                                        "auto-attach hint received via manager handshake"
-                                                    );
-                                                    let attach_state =
-                                                        attach_state_for_actions.clone();
-                                                    let session_for_attach =
-                                                        poll_session_id.clone();
-                                                    let bearer = publish_token_for_session.clone();
-                                                    info!(
-                                                        target = "controller.handshake.attach",
-                                                        session_id = %poll_session_id,
-                                                        private_beach_id = %auto_hint.private_beach_id,
-                                                        bearer_override = bearer.is_some(),
-                                                        "triggering auto-attach"
-                                                    );
-                                                    tokio::spawn(async move {
-                                                        trigger_auto_attach(
-                                                            auto_hint,
-                                                            AutoAttachSource::Handshake,
-                                                            session_for_attach,
-                                                            attach_state,
-                                                            bearer,
-                                                        )
-                                                        .await;
-                                                    });
-                                                }
-                                                Err(err) => {
-                                                    warn!(
-                                                        target = "controller.handshake.attach",
-                                                        session_id = %poll_session_id,
-                                                        error = %err,
-                                                        "failed to parse auto-attach hint from handshake"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        if let Some(health_secs) = payload
-                                            .get("viewer_health_interval_secs")
-                                            .and_then(|value| value.as_u64())
-                                            .filter(|value| *value > 0)
-                                        {
-                                            idle_snapshots_for_actions
-                                                .apply_health_interval(Some(Duration::from_secs(
-                                                    health_secs,
-                                                )))
-                                                .await;
-                                        }
-                                    }
-                                }
-                                if kind == "manager_detach" {
-                                    info!(
-                                        target = "controller.actions",
-                                        session_id = %poll_session_id,
-                                        "manager detach received; stopping action consumer"
-                                    );
-                                    if let Some(handle) = consumer_handle.take() {
-                                        handle.abort();
-                                    }
-                                    consumer_started = false;
-                                }
-                                if !control_id.is_empty() {
-                                    let ack_url = format!(
-                                        "{}/sessions/{}/control/ack",
-                                        road_base_url.trim_end_matches('/'),
-                                        poll_session_id
-                                    );
-                                    let _ = http
-                                        .post(&ack_url)
-                                        .json(&json!({ "control_id": control_id }))
-                                        .send()
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(resp) if resp.status().as_u16() == 403 => {
-                        poll_connected = false;
-                        // Invalid code; back off more
-                        sleep(Duration::from_secs(2)).await;
-                    }
-                    Ok(_) => {
-                        poll_connected = false;
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                    Err(err) => {
-                        warn!(target = "controller.actions", error = %err, "control poll failed");
-                        poll_connected = false;
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
-    }
-
-    if let Some((hint, source)) =
-        select_auto_attach_hint(metadata_auto_attach.clone(), env_auto_attach.clone())
-    {
+    if let Some((hint, source)) = handle_auto_attach_decision(
+        metadata_auto_attach.clone(),
+        env_auto_attach.clone(),
+        &session_id,
+        &attach_state,
+    ) {
         let session_for_attach = session_id.clone();
         let attach_state_for_hint = attach_state.clone();
         tokio::spawn(async move {
@@ -755,54 +510,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             )
             .await;
         });
-    } else {
-        debug!(
-            target = "controller.actions",
-            session_id = %session_id,
-            "auto-attach hint unavailable; skipping"
-        );
-    }
-
-    // Spawn a lightweight controller action consumer so manager-queued terminal_write
-    // actions can drive this host (used by the Pong demo agent). This is best-effort:
-    // if the manager URL/token aren’t configured, the host runs normally.
-    if let Some(manager_url) = manager_url_for_actions.clone() {
-        if let Some(bearer) = controller_manager_token.clone() {
-            let auth = ManagerActionAuth::Bearer(bearer.clone());
-            if let Some(_handle) = spawn_action_consumer(
-                controller_ctx.clone(),
-                manager_url.clone(),
-                auth,
-                writer.clone(),
-                transport_hints.clone(),
-                Some(bearer.clone()),
-            ) {
-                info!(
-                            target = "controller.actions",
-                            session_id = %session_id,
-                            manager = %manager_url,
-                    "controller action consumer started"
-                );
-            } else {
-                warn!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    manager = %manager_url,
-                    "failed to start controller action consumer"
-                );
-            }
-        } else {
-            debug!(
-                target = "controller.actions",
-                manager = %manager_url,
-                "manager token unavailable; action consumer disabled"
-            );
-        }
-    } else {
-        debug!(
-            target = "controller.actions",
-            "manager url not configured; action consumer disabled (set PRIVATE_BEACH_MANAGER_URL)"
-        );
     }
 
     let input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1039,14 +746,12 @@ impl ControllerLeaseGrant {
 }
 
 struct ManagerActionClient {
-    http: Client,
     base_url: String,
     auth: ManagerActionAuth,
 }
 
 #[derive(Debug)]
 enum ManagerActionError {
-    Http(reqwest::Error),
     Status(StatusCode, String),
     Decode(String),
 }
@@ -1054,7 +759,6 @@ enum ManagerActionError {
 impl fmt::Display for ManagerActionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ManagerActionError::Http(err) => write!(f, "http send error: {err}"),
             ManagerActionError::Status(code, body) => {
                 write!(f, "unexpected status {} body={}", code, body)
             }
@@ -1067,61 +771,25 @@ impl std::error::Error for ManagerActionError {}
 
 impl ManagerActionClient {
     fn new(base_url: String, auth: ManagerActionAuth) -> Result<Self, reqwest::Error> {
-        let http = Client::builder().build()?;
         Ok(Self {
-            http,
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
         })
     }
 
-    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth {
-            ManagerActionAuth::Bearer(token) => req.bearer_auth(token),
-            ManagerActionAuth::ControllerToken(token) => {
-                req.query(&[("controller_token", token.as_str())])
-            }
-        }
-    }
-
-    async fn send(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, ManagerActionError> {
-        let resp = req.send().await.map_err(ManagerActionError::Http)?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ManagerActionError::Status(status, body));
-        }
-        Ok(resp)
+    fn disabled<T>(&self) -> Result<T, ManagerActionError> {
+        Err(ManagerActionError::Status(
+            StatusCode::FORBIDDEN,
+            "manager http disabled; use unified channel".into(),
+        ))
     }
 
     async fn receive_actions(
         &self,
         session_id: &str,
     ) -> Result<Vec<CtrlActionCommand>, ManagerActionError> {
-        let url = format!("{}/sessions/{session_id}/actions/poll", self.base_url);
-        let resp = self.send(self.apply_auth(self.http.get(url))).await?;
-        let actions = resp
-            .json::<Vec<CtrlActionCommand>>()
-            .await
-            .map_err(|err| ManagerActionError::Decode(err.to_string()))?;
-        if !actions.is_empty() {
-            debug!(
-                target = "controller.actions",
-                session_id = %session_id,
-                count = actions.len(),
-                "http actions polled from manager"
-            );
-        } else {
-            trace!(
-                target = "controller.actions",
-                session_id = %session_id,
-                "http /actions/poll returned no actions"
-            );
-        }
-        Ok(actions)
+        let _ = session_id;
+        self.disabled()
     }
 
     async fn ack_actions(
@@ -1129,13 +797,8 @@ impl ManagerActionClient {
         session_id: &str,
         acks: Vec<CtrlActionAck>,
     ) -> Result<(), ManagerActionError> {
-        if acks.is_empty() {
-            return Ok(());
-        }
-        let url = format!("{}/sessions/{session_id}/actions/ack", self.base_url);
-        self.send(self.apply_auth(self.http.post(url).json(&acks)))
-            .await
-            .map(|_| ())
+        let _ = (session_id, acks);
+        self.disabled()
     }
 
     async fn queue_actions(
@@ -1145,22 +808,8 @@ impl ManagerActionClient {
         actions: &[CtrlActionCommand],
         trace_id: Option<&str>,
     ) -> Result<(), ManagerActionError> {
-        #[derive(Serialize)]
-        struct QueuePayload<'a> {
-            controller_token: &'a str,
-            actions: &'a [CtrlActionCommand],
-        }
-        let url = format!("{}/sessions/{session_id}/actions", self.base_url);
-        let body = QueuePayload {
-            controller_token,
-            actions,
-        };
-        let mut request = self.http.post(url).json(&body);
-        if let Some(trace) = trace_id {
-            request = request.header("X-Trace-Id", trace);
-        }
-        let request = self.apply_auth(request);
-        self.send(request).await.map(|_| ())
+        let _ = (session_id, controller_token, actions, trace_id);
+        self.disabled()
     }
 
     async fn acquire_controller_lease(
@@ -1169,30 +818,8 @@ impl ManagerActionClient {
         ttl_ms: Option<u64>,
         reason: Option<String>,
     ) -> Result<ControllerLeaseGrant, ManagerActionError> {
-        #[derive(Serialize)]
-        struct AcquirePayload {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            ttl_ms: Option<u64>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            reason: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct LeaseResponse {
-            controller_token: String,
-            expires_at_ms: u64,
-        }
-        let url = format!("{}/sessions/{session_id}/controller/lease", self.base_url);
-        let payload = AcquirePayload { ttl_ms, reason };
-        let request = self.apply_auth(self.http.post(url).json(&payload));
-        let response = self.send(request).await?;
-        let lease = response
-            .json::<LeaseResponse>()
-            .await
-            .map_err(|err| ManagerActionError::Decode(err.to_string()))?;
-        Ok(ControllerLeaseGrant {
-            controller_token: lease.controller_token,
-            expires_at_ms: lease.expires_at_ms,
-        })
+        let _ = (session_id, ttl_ms, reason);
+        self.disabled()
     }
 
     async fn release_controller_lease(
@@ -1200,14 +827,8 @@ impl ManagerActionClient {
         session_id: &str,
         controller_token: &str,
     ) -> Result<(), ManagerActionError> {
-        #[derive(Serialize)]
-        struct ReleasePayload<'a> {
-            controller_token: &'a str,
-        }
-        let url = format!("{}/sessions/{session_id}/controller/lease", self.base_url);
-        let body = ReleasePayload { controller_token };
-        let request = self.apply_auth(self.http.delete(url).json(&body));
-        self.send(request).await.map(|_| ())
+        let _ = (session_id, controller_token);
+        self.disabled()
     }
 
     async fn update_transport_status(
@@ -1217,23 +838,8 @@ impl ManagerActionClient {
         latency_ms: Option<u64>,
         last_error: Option<String>,
     ) -> Result<(), ManagerActionError> {
-        #[derive(Serialize)]
-        struct StatusPayload {
-            transport: PairingTransportKind,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            latency_ms: Option<u64>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            last_error: Option<String>,
-        }
-
-        let url = format!("{}/sessions/{session_id}/transport-status", self.base_url);
-        let payload = StatusPayload {
-            transport,
-            latency_ms,
-            last_error,
-        };
-        let request = self.apply_auth(self.http.post(url).json(&payload));
-        self.send(request).await.map(|_| ())
+        let _ = (session_id, transport, latency_ms, last_error);
+        self.disabled()
     }
 }
 
@@ -1305,6 +911,7 @@ impl ControllerAttachState {
 
     fn mark_attached(&self) {
         if !self.attached.swap(true, Ordering::SeqCst) {
+            debug!(target = "controller.attach", "controller marked attached");
             if let Ok(mut guard) = self.blocking_flag.lock() {
                 *guard = true;
                 self.blocking_cv.notify_all();
@@ -1372,6 +979,7 @@ impl ControllerActionContext {
         &self.session_id
     }
 
+    #[allow(dead_code)]
     fn set_client(&self, client: Arc<ManagerActionClient>) {
         let mut guard = self.client.write().unwrap();
         *guard = Some(client);
@@ -1407,32 +1015,7 @@ impl ControllerActionContext {
     }
 
     fn notify_fast_path_ready(&self, runtime: &Handle) {
-        if let Some(client) = self.manager_client() {
-            let session_id = self.session_id.clone();
-            runtime.spawn(async move {
-                match client
-                    .update_transport_status(
-                        &session_id,
-                        PairingTransportKind::Rtc,
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(()) => trace!(
-                        target = "controller.actions.fast_path",
-                        session_id = %session_id,
-                        "reported fast-path readiness to manager"
-                    ),
-                    Err(err) => warn!(
-                        target = "controller.actions.fast_path",
-                        session_id = %session_id,
-                        error = %err,
-                        "failed to report fast-path readiness"
-                    ),
-                }
-            });
-        }
+        let _ = runtime;
     }
 
     #[cfg(test)]
@@ -1455,12 +1038,13 @@ impl ControllerBridge {
         manager_url: impl Into<String>,
         bearer: impl Into<String>,
     ) -> Result<Self, reqwest::Error> {
-        let client =
-            ManagerActionClient::new(manager_url.into(), ManagerActionAuth::Bearer(bearer.into()))?;
         Ok(Self {
             session_id: session_id.into(),
             controller_ctx,
-            queue_client: Arc::new(client),
+            queue_client: Arc::new(ManagerActionClient::new(
+                manager_url.into(),
+                ManagerActionAuth::Bearer(bearer.into()),
+            )?),
         })
     }
 
@@ -1498,20 +1082,8 @@ impl ControllerBridge {
         actions: Vec<CtrlActionCommand>,
         trace_id: Option<String>,
     ) -> Result<ControllerDispatchOutcome, String> {
-        let count = actions.len();
-        self.queue_client
-            .queue_actions(
-                child_session_id,
-                controller_token,
-                &actions,
-                trace_id.as_deref(),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(ControllerDispatchOutcome {
-            via_fast_path: self.controller_ctx.prefers_fast_path(),
-            queued: count,
-        })
+        let _ = (child_session_id, controller_token, actions, trace_id);
+        Err("controller bridge HTTP path disabled; use unified transport".into())
     }
 }
 
@@ -1542,6 +1114,23 @@ fn action_preview(payload: &str) -> String {
     clean
 }
 
+fn metadata_role(metadata: &JoinAuthorizationMetadata) -> Option<String> {
+    metadata.metadata.get("role").cloned()
+}
+
+fn is_manager_channel(metadata: &JoinAuthorizationMetadata) -> bool {
+    matches!(
+        metadata.label.as_deref(),
+        Some(CONTROLLER_CHANNEL_LABEL)
+            | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+            | Some(MANAGER_CHANNEL_LABEL)
+    ) || metadata
+        .metadata
+        .get("role")
+        .map(|role| role == "manager")
+        .unwrap_or(false)
+}
+
 struct ControllerChannelOutcome {
     channel_closed: bool,
     fatal_error: bool,
@@ -1551,6 +1140,19 @@ struct ControllerChannelOutcome {
 struct ControllerInputFrame {
     action_id: String,
     bytes: Vec<u8>,
+}
+
+fn payload_preview_hex(bytes: &[u8], limit: usize) -> String {
+    if bytes.len() > limit {
+        format!(
+            "{} bytes (first {}: {:02x?} …)",
+            bytes.len(),
+            limit,
+            &bytes[..limit]
+        )
+    } else {
+        format!("{} bytes: {:02x?}", bytes.len(), bytes)
+    }
 }
 
 fn run_controller_channel(
@@ -1617,6 +1219,18 @@ fn run_controller_channel(
         match recv_result {
             Ok(Ok(frame)) => {
                 last_received = Instant::now();
+                let payload_preview = payload_preview_hex(&frame.payload, 96);
+                trace!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    transport_id,
+                    kind = %frame.kind,
+                    payload_len = frame.payload.len(),
+                    payload = %payload_preview,
+                    peer_session_id = peer_session_id.as_deref(),
+                    status = "received",
+                    "received controller frame from framed bus"
+                );
                 if frame.kind != "input" {
                     metrics::CONTROLLER_FRAMES
                         .with_label_values(&["recv", frame.kind.as_str()])
@@ -1627,6 +1241,8 @@ fn run_controller_channel(
                         transport_id,
                         kind = %frame.kind,
                         peer_session_id = peer_session_id.as_deref(),
+                        payload = %payload_preview,
+                        status = "ignored_non_input",
                         "ignoring non-input controller frame"
                     );
                     continue;
@@ -1646,10 +1262,23 @@ fn run_controller_channel(
                                 transport_id,
                                 action_id = %input.action_id,
                                 peer_session_id = peer_session_id.as_deref(),
+                                payload = %payload_preview,
+                                status = "duplicate",
                                 "duplicate controller input detected"
                             );
                             continue;
                         }
+                        let input_preview = payload_preview_hex(&input.bytes, 96);
+                        trace!(
+                            target = "controller.actions",
+                            session_id = %session_id,
+                            transport_id,
+                            action_id = %input.action_id,
+                            peer_session_id = peer_session_id.as_deref(),
+                            payload = %input_preview,
+                            status = "decoded",
+                            "decoded controller input frame"
+                        );
                         if let Err(err) = writer.write(&input.bytes) {
                             error!(
                                 target = "controller.actions",
@@ -1690,14 +1319,13 @@ fn run_controller_channel(
                             metrics::CONTROLLER_FRAMES
                                 .with_label_values(&["send", "ack"])
                                 .inc();
-                        }
-                        if let Some(client) = controller_ctx.manager_client() {
-                            spawn_optional_http_ack(
-                                runtime.clone(),
-                                client,
-                                session_id.to_string(),
-                                input.action_id.clone(),
-                                0,
+                            trace!(
+                                target = "controller.actions",
+                                session_id = %session_id,
+                                transport_id,
+                                action_id = %input.action_id,
+                                status = "ack_sent",
+                                "controller ack sent"
                             );
                         }
                         metrics::CONTROLLER_QUEUE
@@ -1710,6 +1338,8 @@ fn run_controller_channel(
                             session_id = %session_id,
                             transport_id,
                             error = %err,
+                            payload = %payload_preview,
+                            status = "decode_failed",
                             "failed to decode controller input frame"
                         );
                     }
@@ -1764,43 +1394,6 @@ fn run_controller_channel(
     }
 }
 
-fn spawn_optional_http_ack(
-    runtime: Handle,
-    client: Arc<ManagerActionClient>,
-    session_id: String,
-    action_id: String,
-    seq: Seq,
-) {
-    runtime.spawn(async move {
-        let ack = CtrlActionAck {
-            id: action_id.clone(),
-            status: CtrlAckStatus::Ok,
-            applied_at: SystemTime::now(),
-            latency_ms: None,
-            error_code: None,
-            error_message: None,
-        };
-        if let Err(err) = client.ack_actions(&session_id, vec![ack]).await {
-            warn!(
-                target = "controller.actions.fast_path.ack",
-                session_id = %session_id,
-                action_id = %action_id,
-                seq,
-                error = %err,
-                "optional http ack for fast path action failed"
-            );
-        } else {
-            debug!(
-                target = "controller.actions.fast_path.ack",
-                session_id = %session_id,
-                action_id = %action_id,
-                seq,
-                "fast path action acked via http"
-            );
-        }
-    });
-}
-
 fn send_controller_ack(
     transport: &Arc<dyn Transport>,
     action_id: &str,
@@ -1835,185 +1428,14 @@ fn spawn_action_consumer(
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
     fast_path_bearer: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let auth_for_client = auth.clone();
-    let client = match ManagerActionClient::new(manager_url.clone(), auth_for_client) {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(
-                target = "controller.actions",
-                error = %err,
-                manager = %manager_url,
-                "manager action client init failed"
-            );
-            return None;
-        }
-    };
-
-    let fast_path_token = fast_path_bearer.unwrap_or_else(|| match &auth {
-        ManagerActionAuth::Bearer(token) => token.clone(),
-        ManagerActionAuth::ControllerToken(token) => token.clone(),
-    });
-    let fast_path_transport = match HttpTransport::new(
-        manager_url.clone(),
-        StaticTokenProvider::new(fast_path_token.clone()),
-    ) {
-        Ok(t) => Some(Arc::new(t)),
-        Err(err) => {
-            warn!(
-                target = "controller.actions.fast_path",
-                error = %err,
-                manager = %manager_url,
-                "fast-path action transport init failed; using http only"
-            );
-            None
-        }
-    };
-
-    let client = Arc::new(client);
-    ctx.set_client(client.clone());
-    let session_for_actions = ctx.session_id().to_string();
-    let attach_state = ctx.attach_state();
-
-    Some(tokio::spawn(async move {
-        if !attach_state.is_attached() {
-            info!(
-                target = "controller.actions",
-                session_id = %session_for_actions,
-                "waiting for manager attach before starting controller action consumer"
-            );
-            let wait_started = Instant::now();
-            attach_state.wait_for_attach().await;
-            trace_attach_wait_completion(&session_for_actions, "http_consumer", wait_started);
-            info!(
-                target = "controller.actions",
-                session_id = %session_for_actions,
-                "manager attach confirmed; controller action consumer starting"
-            );
-        }
-        debug!(
-            target = "controller.actions",
-            session_id = %session_for_actions,
-            "controller action consumer loop running"
-        );
-        if let Some(tp) = fast_path_transport.as_ref() {
-            let hints_snapshot = { transport_hints.read().await.clone() };
-            tp.apply_transport_hints(&hints_snapshot).await;
-            ctx.fast_path_online();
-            info!(
-                target = "controller.actions.fast_path",
-                session_id = %session_for_actions,
-                "fast-path action transport configured"
-            );
-        }
-        loop {
-            let mut actions: Vec<CtrlActionCommand> = Vec::new();
-            let mut used_fast_path = false;
-            if let Some(tp) = fast_path_transport.as_ref() {
-                match tp.receive_actions(&session_for_actions).await {
-                    Ok(received) => {
-                        used_fast_path = true;
-                        actions = received;
-                    }
-                    Err(err) => {
-                        warn!(
-                            target = "controller.actions.fast_path",
-                            session_id = %session_for_actions,
-                            error = %err,
-                            "fast-path receive failed; falling back to manager http poll"
-                        );
-                    }
-                }
-            }
-            if !used_fast_path {
-                match client.receive_actions(&session_for_actions).await {
-                    Ok(received) => actions = received,
-                    Err(err) => {
-                        warn!(
-                            target = "controller.actions",
-                            session_id = %session_for_actions,
-                            error = %err,
-                            "receive_actions failed; retrying"
-                        );
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                }
-            }
-            if !actions.is_empty() {
-                info!(
-                target = "controller.actions",
-                    session_id = %session_for_actions,
-                    count = actions.len(),
-                    "received controller actions"
-                );
-                for cmd in actions.iter() {
-                    match controller_action_bytes(cmd) {
-                        Ok(bytes) => match writer_for_actions.write(bytes.as_bytes()) {
-                            Ok(()) => {
-                                debug!(
-                                    target = "controller.actions",
-                                    session_id = %session_for_actions,
-                                    command_id = %cmd.id,
-                                    bytes = bytes.len(),
-                                    preview = %action_preview(bytes),
-                                    "applied terminal_write action"
-                                );
-                            }
-                            Err(err) => {
-                                warn!(target = "controller.actions", error = %err, "pty write failed for action");
-                            }
-                        },
-                        Err(err) => {
-                            warn!(
-                                target = "controller.actions",
-                                session_id = %session_for_actions,
-                                command_id = %cmd.id,
-                                error = %err,
-                                "unsupported controller action"
-                            );
-                        }
-                    }
-                }
-                let acks: Vec<CtrlActionAck> = actions
-                    .iter()
-                    .map(|c| CtrlActionAck {
-                        id: c.id.clone(),
-                        status: CtrlAckStatus::Ok,
-                        applied_at: std::time::SystemTime::now(),
-                        latency_ms: None,
-                        error_code: None,
-                        error_message: None,
-                    })
-                    .collect();
-                if used_fast_path {
-                    if let Some(tp) = fast_path_transport.as_ref() {
-                        if let Err(err) = tp.ack_actions(&session_for_actions, acks).await {
-                            warn!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_for_actions,
-                                error = %err,
-                                "ack failed via fast-path transport"
-                            );
-                        }
-                    }
-                } else if let Err(err) = client.ack_actions(&session_for_actions, acks).await {
-                    warn!(
-                        target = "controller.actions",
-                        session_id = %session_for_actions,
-                        error = %err,
-                        "ack failed"
-                    );
-                }
-            } else {
-                debug!(
-                    target = "controller.actions",
-                    session_id = %session_for_actions,
-                    "controller action poll returned empty set"
-                );
-                sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }))
+    let _ = (auth, writer_for_actions, transport_hints, fast_path_bearer);
+    warn!(
+        target = "controller.actions",
+        session_id = %ctx.session_id(),
+        manager = %manager_url,
+        "http action consumer disabled; unified transport required"
+    );
+    None
 }
 
 fn spawn_unified_action_consumer(
@@ -2050,6 +1472,12 @@ fn spawn_unified_action_consumer(
         loop {
             match bridge.receive_actions(&session_for_actions).await {
                 Ok(actions) if !actions.is_empty() => {
+                    debug!(
+                        target = "controller.actions",
+                        session_id = %session_for_actions,
+                        count = actions.len(),
+                        "received unified controller actions"
+                    );
                     let mut acks: Vec<CtrlActionAck> = Vec::with_capacity(actions.len());
                     for cmd in actions {
                         trace!(
@@ -2186,7 +1614,7 @@ fn manager_supports_extensions(hints: &HashMap<String, Value>) -> bool {
     if supports_extensions_namespace(hints) {
         return true;
     }
-    // Honor fast_path_webrtc presence as an affirmative signal.
+    // Honor legacy fast_path_webrtc presence as an affirmative signal.
     if hints.get("fast_path_webrtc").is_some() {
         return true;
     }
@@ -2200,8 +1628,10 @@ fn supports_extensions_namespace(hints: &HashMap<String, Value>) -> bool {
         .and_then(|value| value.as_object())
         .and_then(|obj| obj.get("namespaces"))
         .map(|namespaces| match namespaces {
-            Value::Array(items) => items.iter().any(|ns| ns.as_str() == Some("fastpath")),
-            Value::String(single) => single == "fastpath",
+            Value::Array(items) => items
+                .iter()
+                .any(|ns| matches!(ns.as_str(), Some("manager") | Some("fastpath"))),
+            Value::String(single) => single == "manager" || single == "fastpath",
             _ => false,
         })
         .unwrap_or(false)
@@ -2431,14 +1861,16 @@ struct UnifiedManagerHandle {
     preferred: Arc<AtomicBool>,
     legacy_fastpath: bool,
     bridge: Arc<AsyncRwLock<Option<Arc<UnifiedBuggyTransport>>>>,
+    bridge_notify: Arc<Notify>,
 }
 
 impl UnifiedManagerHandle {
     fn new(_preferred: bool, legacy_fastpath: bool) -> Self {
         Self {
-            preferred: Arc::new(AtomicBool::new(false)),
+            preferred: Arc::new(AtomicBool::new(_preferred)),
             legacy_fastpath: legacy_fastpath && false,
             bridge: Arc::new(AsyncRwLock::new(None)),
+            bridge_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -2453,10 +1885,21 @@ impl UnifiedManagerHandle {
     async fn set_bridge(&self, bridge: Arc<UnifiedBuggyTransport>) {
         let mut guard = self.bridge.write().await;
         *guard = Some(bridge);
+        self.bridge_notify.notify_waiters();
     }
 
     async fn bridge(&self) -> Option<Arc<UnifiedBuggyTransport>> {
         self.bridge.read().await.clone()
+    }
+
+    async fn bridge_or_wait(&self, timeout: Duration) -> Option<Arc<UnifiedBuggyTransport>> {
+        if let Some(existing) = self.bridge().await {
+            return Some(existing);
+        }
+        match tokio::time::timeout(timeout, self.bridge_notify.notified()).await {
+            Ok(_) => self.bridge().await,
+            Err(_) => None,
+        }
     }
 }
 
@@ -2472,34 +1915,23 @@ async fn spawn_idle_snapshot_worker(
     _fast_path_channel: Arc<FastPathStateChannel>,
     _unified_handle: UnifiedManagerHandle,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
-    if interval.is_zero() {
-        return None;
-    }
-    let transport = match HttpTransport::new(base_url, StaticTokenProvider::new(token)) {
-        Ok(transport) => Arc::new(transport),
-        Err(err) => {
-            warn!(
-                target = "private_beach",
-                error = %err,
-                "idle snapshot transport initialization failed"
-            );
-            return None;
-        }
-    };
-    let hints_snapshot = { transport_hints.read().await.clone() };
-    transport.apply_transport_hints(&hints_snapshot).await;
-    let (cancel_tx, cancel_rx) = oneshot::channel();
-    let worker = IdleSnapshotWorker::new(
+    warn!(
+        target = "private_beach.state",
+        session_id = %session_id,
+        "idle snapshot HTTP publisher disabled; awaiting unified channel"
+    );
+    let _ = (
         interval,
+        token,
+        base_url,
         grid,
         cursor_tracker,
         last_terminal_update,
-        Arc::new(StatePublisher::new(transport, session_id)),
+        transport_hints,
+        _fast_path_channel,
+        _unified_handle,
     );
-    let handle = tokio::spawn(async move {
-        worker.run(cancel_rx).await;
-    });
-    Some((handle, cancel_tx))
+    None
 }
 
 fn spawn_health_reporter(
@@ -2509,83 +1941,13 @@ fn spawn_health_reporter(
     session_id: String,
     unified_handle: UnifiedManagerHandle,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
-    if period.is_zero() {
-        return None;
-    }
-    let transport = match HttpTransport::new(base_url, StaticTokenProvider::new(token)) {
-        Ok(transport) => Arc::new(transport),
-        Err(err) => {
-            warn!(
-                target = "private_beach",
-                error = %err,
-                "health reporter transport initialization failed"
-            );
-            return None;
-        }
-    };
-    let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    let unified = unified_handle.clone();
-    let handle = tokio::spawn(async move {
-        let mut ticker = interval(period);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let heartbeat = HealthHeartbeat {
-                        queue_depth: 0,
-                        cpu_load: None,
-                        memory_bytes: None,
-                        degraded: false,
-                        warnings: Vec::new(),
-                    };
-                    let mut sent_unified = false;
-                    if unified.prefers_unified() {
-                        if let Some(bridge) = unified.bridge().await {
-                            match bridge.signal_health(&session_id, heartbeat.clone()).await {
-                                Ok(()) => {
-                                    metrics::EXTENSION_SENT
-                                        .with_label_values(&["fastpath", "health", "host", "unified"])
-                                        .inc();
-                                    trace!(
-                                        target = "transport.extension",
-                                        session_id = %session_id,
-                                        namespace = "fastpath",
-                                        kind = "health",
-                                        "health heartbeat sent via unified transport"
-                                    );
-                                    sent_unified = true;
-                                }
-                                Err(err) => {
-                                    metrics::EXTENSION_FALLBACK
-                                        .with_label_values(&["fastpath", "health", "host", "unified_send_error"])
-                                        .inc();
-                                    warn!(
-                                        target = "transport.extension",
-                                        session_id = %session_id,
-                                        error = %err,
-                                        "unified health send failed; falling back to http"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if !sent_unified {
-                        if let Err(err) = transport.signal_health(&session_id, heartbeat).await {
-                            warn!(
-                                target = "private_beach",
-                                session_id = %session_id,
-                                error = %err,
-                                "health reporter publish failed"
-                            );
-                        }
-                    }
-                }
-                _ = &mut cancel_rx => {
-                    break;
-                }
-            }
-        }
-    });
-    Some((handle, cancel_tx))
+    warn!(
+        target = "private_beach",
+        session_id = %session_id,
+        "health reporter disabled: HTTP transport disallowed; relying on unified transport only"
+    );
+    let _ = (period, token, base_url, unified_handle);
+    None
 }
 
 struct StatePublisher {
@@ -2658,6 +2020,12 @@ impl IdleSnapshotWorker {
                     let frame = capture_terminal_frame(&self.grid, &self.cursor_tracker);
                     match self.publisher.publish(frame).await {
                         Ok(_) => {
+                            trace!(
+                                target = "private_beach.state",
+                                last_terminal_update = last,
+                                interval_ms = self.interval.as_millis(),
+                                "idle snapshot published"
+                            );
                             self.last_terminal_update
                                 .store(now_millis(), Ordering::Relaxed);
                         }
@@ -2771,40 +2139,19 @@ impl IdleSnapshotController {
     }
 
     async fn publisher(&self) -> Option<Arc<StatePublisher>> {
-        if let Some(publisher) = self.publisher.lock().await.as_ref() {
-            return Some(publisher.clone());
-        }
-        self.rebuild_publisher().await
+        let _ = self.publisher.lock().await;
+        None
     }
 
     async fn rebuild_publisher(&self) -> Option<Arc<StatePublisher>> {
-        let base_url = { self.base_url.lock().await.clone() };
-        let token_opt = { self.token.lock().await.clone() };
+        warn!(
+            target = "private_beach",
+            session_id = %self.session_id,
+            "http state publisher disabled; unified channel required"
+        );
         let mut slot = self.publisher.lock().await;
-        let Some(token) = token_opt else {
-            *slot = None;
-            return None;
-        };
-        match HttpTransport::new(base_url.clone(), StaticTokenProvider::new(token.clone())) {
-            Ok(transport) => {
-                let transport = Arc::new(transport);
-                let hints_snapshot = { self.transport_hints.read().await.clone() };
-                transport.apply_transport_hints(&hints_snapshot).await;
-                let publisher = Arc::new(StatePublisher::new(transport, self.session_id.clone()));
-                *slot = Some(publisher.clone());
-                Some(publisher)
-            }
-            Err(err) => {
-                warn!(
-                    target = "private_beach",
-                    session_id = %self.session_id,
-                    error = %err,
-                    "failed to rebuild http state publisher"
-                );
-                *slot = None;
-                None
-            }
-        }
+        *slot = None;
+        None
     }
 
     async fn set_token(&self, token: Option<String>) {
@@ -2830,85 +2177,30 @@ impl IdleSnapshotController {
         }
     }
 
-    async fn update_fast_path_hint(&self, hint: Value) {
-        {
-            let mut guard = self.transport_hints.write().await;
-            guard.insert("fast_path_webrtc".into(), hint);
-        }
-        let current_interval = { self.state.lock().await.interval };
-        if let Some(interval) = current_interval {
-            // Restart the worker so the new hint is applied to the HttpTransport.
-            self.apply_hint(None).await;
-            self.apply_hint(Some(interval)).await;
-        }
+    async fn update_fast_path_hint(&self, _hint: Value) {
+        warn!(
+            target = "private_beach",
+            session_id = %self.session_id,
+            "fast_path hints ignored; unified channel only"
+        );
     }
 
     async fn apply_hint(&self, interval: Option<Duration>) {
         let interval = interval.filter(|value| !value.is_zero());
         let mut state = self.state.lock().await;
-        if interval == state.interval {
-            return;
-        }
-        let cancel = state.cancel.take();
-        let handle = state.handle.take();
-        state.interval = None;
-        drop(state);
-        if let Some(cancel) = cancel {
+        if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(());
         }
-        if let Some(handle) = handle {
+        if let Some(handle) = state.handle.take() {
             handle.abort();
         }
-        if let Some(interval) = interval {
-            let token_opt = { self.token.lock().await.clone() };
-            let Some(token) = token_opt else {
-                warn!(
-                    target = "private_beach",
-                    interval_ms = interval.as_millis(),
-                    "idle snapshot hint received but no access token available"
-                );
-                return;
-            };
-            let base_url = { self.base_url.lock().await.clone() };
-            match spawn_idle_snapshot_worker(
-                interval,
-                token,
-                base_url,
-                self.session_id.clone(),
-                self.grid.clone(),
-                self.cursor_tracker.clone(),
-                self.last_terminal_update.clone(),
-                self.transport_hints.clone(),
-                self._fast_path_channel.clone(),
-                self._unified.clone(),
-            )
-            .await
-            {
-                Some((handle, cancel)) => {
-                    let mut state = self.state.lock().await;
-                    state.interval = Some(interval);
-                    state.handle = Some(handle);
-                    state.cancel = Some(cancel);
-                    info!(
-                        target = "private_beach",
-                        session_id = %self.session_id,
-                        interval_ms = interval.as_millis(),
-                        "idle snapshot worker enabled"
-                    );
-                }
-                None => {
-                    warn!(
-                        target = "private_beach",
-                        session_id = %self.session_id,
-                        "idle snapshot worker failed to start"
-                    );
-                }
-            }
-        } else {
-            info!(
+        state.interval = None;
+        drop(state);
+        if interval.is_some() {
+            warn!(
                 target = "private_beach",
                 session_id = %self.session_id,
-                "idle snapshot worker disabled"
+                "idle snapshot worker disabled (unified-only mode)"
             );
         }
     }
@@ -2921,9 +2213,6 @@ impl IdleSnapshotController {
     async fn apply_health_interval(&self, interval: Option<Duration>) {
         let interval = interval.filter(|value| !value.is_zero());
         let mut state = self.health.lock().await;
-        if interval == state.interval {
-            return;
-        }
         let cancel = state.cancel.take();
         let handle = state.handle.take();
         state.interval = None;
@@ -2934,49 +2223,11 @@ impl IdleSnapshotController {
         if let Some(handle) = handle {
             handle.abort();
         }
-        if let Some(interval) = interval {
-            let token_opt = { self.token.lock().await.clone() };
-            let Some(token) = token_opt else {
-                warn!(
-                    target = "private_beach",
-                    interval_ms = interval.as_millis(),
-                    "health reporter hint received but no access token available"
-                );
-                return;
-            };
-            let base_url = { self.base_url.lock().await.clone() };
-            match spawn_health_reporter(
-                interval,
-                token,
-                base_url,
-                self.session_id.clone(),
-                self._unified.clone(),
-            ) {
-                Some((handle, cancel)) => {
-                    let mut state = self.health.lock().await;
-                    state.interval = Some(interval);
-                    state.handle = Some(handle);
-                    state.cancel = Some(cancel);
-                    info!(
-                        target = "private_beach",
-                        session_id = %self.session_id,
-                        interval_ms = interval.as_millis(),
-                        "health reporter enabled"
-                    );
-                }
-                None => {
-                    warn!(
-                        target = "private_beach",
-                        session_id = %self.session_id,
-                        "failed to start health reporter"
-                    );
-                }
-            }
-        } else {
-            info!(
+        if interval.is_some() {
+            warn!(
                 target = "private_beach",
                 session_id = %self.session_id,
-                "health reporter disabled"
+                "health reporter disabled (unified-only mode)"
             );
         }
     }
@@ -3014,17 +2265,37 @@ impl HttpStateStreamer {
         }
     }
 
-    async fn maybe_publish(&self) {
-        if self.unified_manager.bridge().await.is_some() {
-            return;
-        }
+    async fn maybe_publish(&self, force: bool) {
         let last_update = self.last_terminal_update.load(Ordering::Relaxed);
         let last_sent = self.last_published.load(Ordering::Relaxed);
         let now = now_millis();
-        if last_update == 0 || last_update <= last_sent {
+        let has_update = last_update > 0 && last_update > last_sent;
+        let mut unified = self.unified_manager.bridge().await;
+        if unified.is_none() && has_update {
+            // If a controller transport attaches shortly after boot, wait briefly
+            // so we can mirror the initial snapshot over the unified bridge instead
+            // of dropping it due to the disabled HTTP publisher.
+            trace!(
+                target = "private_beach.state",
+                session_id = %self.controller.session_id(),
+                "awaiting unified bridge before publishing snapshot"
+            );
+            unified = self
+                .unified_manager
+                .bridge_or_wait(Duration::from_secs(10))
+                .await;
+        }
+        let use_unified = unified.is_some();
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
+        if !use_unified && force {
+            debug!(
+                target = "private_beach.state",
+                session_id = %self.controller.session_id(),
+                "state publish skipped (unified bridge unavailable)"
+            );
             return;
         }
-        if now.saturating_sub(last_sent) < self.min_interval_ms {
+        if !force && !has_update && now.saturating_sub(last_sent) < self.min_interval_ms {
             return;
         }
         if self
@@ -3034,24 +2305,61 @@ impl HttpStateStreamer {
         {
             return;
         }
-        let Some(publisher) = self.controller.publisher().await else {
-            self.in_flight.store(false, Ordering::SeqCst);
-            return;
-        };
+        debug!(
+            target = "private_beach.state",
+            session_id = %self.controller.session_id(),
+            last_update,
+            last_sent,
+            has_update,
+            use_unified,
+            in_flight,
+            "maybe_publish sending snapshot"
+        );
         let frame = capture_terminal_frame(&self.grid, &self.cursor_tracker);
         let last_published = self.last_published.clone();
         let in_flight = self.in_flight.clone();
         let session_id = self.controller.session_id().to_string();
+        let publisher: Option<Arc<StatePublisher>> = if unified.is_some() {
+            None
+        } else {
+            self.controller.publisher().await
+        };
+        let unified_clone = unified.clone();
         tokio::spawn(async move {
             let sent_at = now_millis();
-            match publisher.publish(frame).await {
-                Ok(()) => {
+            let result = if let Some(bridge) = unified_clone {
+                let diff = StateDiff {
+                    sequence: 0,
+                    emitted_at: SystemTime::now(),
+                    payload: build_terminal_payload(&frame),
+                };
+                bridge
+                    .send_state(&session_id, diff)
+                    .await
+                    .map(|_| "unified")
+            } else {
+                match publisher {
+                    Some(p) => p
+                        .publish(frame)
+                        .await
+                        .map(|_| "http_fallback")
+                        .map_err(|err| HarnessError::Transport(err)),
+                    None => Err(HarnessError::Transport(
+                        "publisher unavailable for state mirror".into(),
+                    )),
+                }
+            };
+            match result {
+                Ok(label) => {
                     last_published.store(sent_at.max(last_update), Ordering::Relaxed);
-                    trace!(
+                    debug!(
                         target = "private_beach.state",
                         session_id = %session_id,
-                        transport = "http_fallback",
-                        "mirrored state to manager via http"
+                        transport = %label,
+                        has_update,
+                        last_update,
+                        last_sent,
+                        "mirrored state to manager"
                     );
                 }
                 Err(err) => {
@@ -3059,7 +2367,11 @@ impl HttpStateStreamer {
                         target = "private_beach.state",
                         session_id = %session_id,
                         error = %err,
-                        "http state mirror publish failed"
+                        has_update,
+                        last_update,
+                        last_sent,
+                        transport = if use_unified { "unified" } else { "http_fallback" },
+                        "state mirror publish failed"
                     );
                 }
             }
@@ -3194,7 +2506,7 @@ fn spawn_input_listener(
     session_id: String,
     controller_ctx: Option<Arc<ControllerActionContext>>,
 ) -> thread::JoinHandle<()> {
-    let runtime_handle = Handle::try_current().ok();
+    let _runtime_handle = Handle::try_current().ok();
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
     thread::spawn(move || {
@@ -3213,317 +2525,297 @@ fn spawn_input_listener(
         let is_controller_channel = controller_ctx.is_some();
 
         if is_controller_channel {
-            match (controller_ctx, runtime_handle) {
-                (Some(ctx), Some(handle)) => {
-                    let outcome = run_controller_channel(
-                        Arc::clone(&transport),
-                        transport_kind,
-                        writer.clone(),
-                        &session_id,
-                        client_label.clone(),
-                        client_peer_id.clone(),
-                        peer_session_id.clone(),
-                        ctx,
-                        handle,
-                    );
-                    channel_closed = outcome.channel_closed;
-                    fatal_error = outcome.fatal_error;
-                }
-                _ => {
-                    fatal_error = true;
-                    error!(
-                        target = "controller.actions.fast_path",
-                        session_id = %session_id,
-                        transport_id,
-                        "unable to start fast path controller channel (missing runtime/context)"
-                    );
-                }
+            info!(
+                target = "controller.actions",
+                session_id = %session_id,
+                transport_id,
+                client_label = client_label.as_deref(),
+                client_peer_id = client_peer_id.as_deref(),
+                peer_session_id = peer_session_id.as_deref(),
+                "controller channel delegated to unified bridge; processing client input locally"
+            );
+        }
+
+        loop {
+            if let Some(g) = &gate {
+                g.wait_until_resumed();
             }
-        } else {
-            loop {
-                if let Some(g) = &gate {
-                    g.wait_until_resumed();
-                }
-                match transport.recv(Duration::from_millis(250)) {
-                    Ok(message) => {
-                        let transport_sequence = message.sequence;
-                        match message.payload {
-                            Payload::Binary(bytes) => {
-                                match protocol::decode_client_frame_binary(&bytes) {
-                                    Ok(frame) => {
-                                        if tracing::enabled!(Level::TRACE) {
-                                            trace!(
-                                                target = "sync::incoming",
-                                                transport_id,
-                                                transport = ?transport_kind,
-                                                transport_sequence,
-                                                frame = client_frame_label(&frame),
-                                                payload_len = bytes.len(),
-                                                "received client frame"
-                                            );
-                                        }
-                                        match frame {
-                                            WireClientFrame::Input { seq, data } => {
-                                                if let Some(g) = &gate {
-                                                    g.wait_until_resumed();
-                                                }
-                                                if seq <= last_seq {
-                                                    trace!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        seq,
-                                                        "dropping duplicate input sequence"
-                                                    );
-                                                    continue;
-                                                }
-                                                if let Err(err) = writer.write(&data) {
-                                                    error!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        seq,
-                                                        error = %err,
-                                                        "pty write failed"
-                                                    );
-                                                    break;
-                                                }
-                                                if tracing::enabled!(Level::TRACE) {
-                                                    trace!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        seq,
-                                                        bytes = data.len(),
-                                                        dump = %logctl::hexdump(&data),
-                                                        "forwarded client input"
-                                                    );
-                                                }
-                                                last_seq = seq;
-                                            }
-                                            WireClientFrame::Resize { cols, rows } => {
-                                                let clamped_cols = cols.min(MAX_PTY_COLS);
-                                                let clamped_rows = rows.min(MAX_PTY_ROWS);
-                                                if let Err(err) =
-                                                    process.resize(clamped_cols, clamped_rows)
-                                                {
-                                                    warn!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        cols = clamped_cols,
-                                                        rows = clamped_rows,
-                                                        error = %err,
-                                                        "pty resize failed"
-                                                    );
-                                                }
-                                                if let Ok(mut guard) = emulator.lock() {
-                                                    guard.resize(
-                                                        clamped_rows as usize,
-                                                        clamped_cols as usize,
-                                                    );
-                                                }
-                                                if tracing::enabled!(Level::TRACE) {
-                                                    trace!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        cols = clamped_cols,
-                                                        rows = clamped_rows,
-                                                        client_label = client_label.as_deref(),
-                                                        client_peer_id = client_peer_id.as_deref(),
-                                                        "processed resize request"
-                                                    );
-                                                }
-                                            }
-                                            WireClientFrame::ViewportCommand { command } => {
-                                                if let Err(err) = handle_viewport_command(
-                                                    command,
-                                                    &writer,
-                                                    transport_id,
-                                                    &transport_kind,
-                                                    &grid,
-                                                    &forwarder_tx,
-                                                ) {
-                                                    warn!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        error = %err,
-                                                        command = ?command,
-                                                        "viewport command failed"
-                                                    );
-                                                }
-                                            }
-                                            WireClientFrame::Extension { frame } => {
-                                                let is_viewer = !is_controller_channel;
-                                                if is_viewer && frame.namespace == "fastpath" {
-                                                    trace!(
-                                                        target = "transport.extension",
-                                                        transport_id,
-                                                        namespace = %frame.namespace,
-                                                        kind = %frame.kind,
-                                                        "viewer extension ignored (fastpath not allowed)"
-                                                    );
-                                                    continue;
-                                                }
-                                                metrics::EXTENSION_RECEIVED
-                                                    .with_label_values(&[
-                                                        &frame.namespace,
-                                                        &frame.kind,
-                                                        if is_controller_channel {
-                                                            "controller"
-                                                        } else {
-                                                            "viewer"
-                                                        },
-                                                    ])
-                                                    .inc();
-                                                extensions::publish(transport.id(), frame.clone());
-                                                trace!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    namespace = %frame.namespace,
-                                                    kind = %frame.kind,
-                                                    payload_len = frame.payload.len(),
-                                                    "received extension frame with no handler"
-                                                );
-                                            }
-                                            WireClientFrame::RequestBackfill {
-                                                subscription,
-                                                request_id,
-                                                start_row,
-                                                count,
-                                            } => {
-                                                let capped =
-                                                    count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
-                                                if capped == 0 {
-                                                    continue;
-                                                }
-                                                if let Err(err) =
-                                                    backfill_tx.send(BackfillCommand {
-                                                        transport_id: transport.id(),
-                                                        subscription,
-                                                        request_id,
-                                                        start_row,
-                                                        count: capped,
-                                                    })
-                                                {
-                                                    warn!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        request_id,
-                                                        error = %err,
-                                                        "failed to enqueue backfill request"
-                                                    );
-                                                } else {
-                                                    trace!(
-                                                        target = "sync::incoming",
-                                                        transport_id,
-                                                        transport = ?transport_kind,
-                                                        request_id,
-                                                        start_row,
-                                                        requested = count,
-                                                        enqueued = capped,
-                                                        "queued history backfill request"
-                                                    );
-                                                }
-                                            }
-                                            WireClientFrame::Unknown => {}
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if let Ok(host_frame) =
-                                            protocol::decode_host_frame_binary(&bytes)
-                                        {
-                                            if let HostFrame::Extension { frame } = host_frame {
-                                                let is_viewer = !is_controller_channel;
-                                                if is_viewer && frame.namespace == "fastpath" {
-                                                    trace!(
-                                                        target = "transport.extension",
-                                                        transport_id,
-                                                        namespace = %frame.namespace,
-                                                        kind = %frame.kind,
-                                                        "viewer host-encoded extension ignored (fastpath not allowed)"
-                                                    );
-                                                    continue;
-                                                }
-                                                metrics::EXTENSION_RECEIVED
-                                                    .with_label_values(&[
-                                                        &frame.namespace,
-                                                        &frame.kind,
-                                                        if is_controller_channel {
-                                                            "controller"
-                                                        } else {
-                                                            "viewer"
-                                                        },
-                                                    ])
-                                                    .inc();
-                                                extensions::publish(transport.id(), frame.clone());
-                                                trace!(
-                                                    target = "transport.extension",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    namespace = %frame.namespace,
-                                                    kind = %frame.kind,
-                                                    "received host-encoded extension frame"
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                        warn!(
+            match transport.recv(Duration::from_millis(250)) {
+                Ok(message) => {
+                    let transport_sequence = message.sequence;
+                    match message.payload {
+                        Payload::Binary(bytes) => {
+                            match protocol::decode_client_frame_binary(&bytes) {
+                                Ok(frame) => {
+                                    if tracing::enabled!(Level::TRACE) {
+                                        trace!(
                                             target = "sync::incoming",
                                             transport_id,
                                             transport = ?transport_kind,
                                             transport_sequence,
-                                            error = %err,
-                                            "failed to decode client frame"
+                                            frame = client_frame_label(&frame),
+                                            payload_len = bytes.len(),
+                                            "received client frame"
                                         );
                                     }
+                                    match frame {
+                                        WireClientFrame::Input { seq, data } => {
+                                            if let Some(g) = &gate {
+                                                g.wait_until_resumed();
+                                            }
+                                            if seq <= last_seq {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    "dropping duplicate input sequence"
+                                                );
+                                                continue;
+                                            }
+                                            if let Err(err) = writer.write(&data) {
+                                                error!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    error = %err,
+                                                    "pty write failed"
+                                                );
+                                                break;
+                                            }
+                                            if tracing::enabled!(Level::TRACE) {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    bytes = data.len(),
+                                                    dump = %logctl::hexdump(&data),
+                                                    "forwarded client input"
+                                                );
+                                            }
+                                            last_seq = seq;
+                                        }
+                                        WireClientFrame::Resize { cols, rows } => {
+                                            let clamped_cols = cols.min(MAX_PTY_COLS);
+                                            let clamped_rows = rows.min(MAX_PTY_ROWS);
+                                            if let Err(err) =
+                                                process.resize(clamped_cols, clamped_rows)
+                                            {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    cols = clamped_cols,
+                                                    rows = clamped_rows,
+                                                    error = %err,
+                                                    "pty resize failed"
+                                                );
+                                            }
+                                            if let Ok(mut guard) = emulator.lock() {
+                                                guard.resize(
+                                                    clamped_rows as usize,
+                                                    clamped_cols as usize,
+                                                );
+                                            }
+                                            if tracing::enabled!(Level::TRACE) {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    cols = clamped_cols,
+                                                    rows = clamped_rows,
+                                                    client_label = client_label.as_deref(),
+                                                    client_peer_id = client_peer_id.as_deref(),
+                                                    "processed resize request"
+                                                );
+                                            }
+                                        }
+                                        WireClientFrame::ViewportCommand { command } => {
+                                            if let Err(err) = handle_viewport_command(
+                                                command,
+                                                &writer,
+                                                transport_id,
+                                                &transport_kind,
+                                                &grid,
+                                                &forwarder_tx,
+                                            ) {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    error = %err,
+                                                    command = ?command,
+                                                    "viewport command failed"
+                                                );
+                                            }
+                                        }
+                                        WireClientFrame::Extension { frame } => {
+                                            let is_viewer = !is_controller_channel;
+                                            if is_viewer && frame.namespace == "fastpath" {
+                                                trace!(
+                                                    target = "transport.extension",
+                                                    transport_id,
+                                                    namespace = %frame.namespace,
+                                                    kind = %frame.kind,
+                                                    "viewer extension ignored (fastpath not allowed)"
+                                                );
+                                                continue;
+                                            }
+                                            metrics::EXTENSION_RECEIVED
+                                                .with_label_values(&[
+                                                    &frame.namespace,
+                                                    &frame.kind,
+                                                    if is_controller_channel {
+                                                        "controller"
+                                                    } else {
+                                                        "viewer"
+                                                    },
+                                                ])
+                                                .inc();
+                                            extensions::publish(transport.id(), frame.clone());
+                                            trace!(
+                                                target = "sync::incoming",
+                                                transport_id,
+                                                transport = ?transport_kind,
+                                                namespace = %frame.namespace,
+                                                kind = %frame.kind,
+                                                payload_len = frame.payload.len(),
+                                                "received extension frame with no handler"
+                                            );
+                                        }
+                                        WireClientFrame::RequestBackfill {
+                                            subscription,
+                                            request_id,
+                                            start_row,
+                                            count,
+                                        } => {
+                                            let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
+                                            if capped == 0 {
+                                                continue;
+                                            }
+                                            if let Err(err) = backfill_tx.send(BackfillCommand {
+                                                transport_id: transport.id(),
+                                                subscription,
+                                                request_id,
+                                                start_row,
+                                                count: capped,
+                                            }) {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    request_id,
+                                                    error = %err,
+                                                    "failed to enqueue backfill request"
+                                                );
+                                            } else {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    request_id,
+                                                    start_row,
+                                                    requested = count,
+                                                    enqueued = capped,
+                                                    "queued history backfill request"
+                                                );
+                                            }
+                                        }
+                                        WireClientFrame::Unknown => {}
+                                    }
                                 }
-                            }
-                            Payload::Text(text) => {
-                                let trimmed = text.trim();
-                                if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                                    debug!(
+                                Err(err) => {
+                                    if let Ok(host_frame) =
+                                        protocol::decode_host_frame_binary(&bytes)
+                                    {
+                                        if let HostFrame::Extension { frame } = host_frame {
+                                            let is_viewer = !is_controller_channel;
+                                            if is_viewer && frame.namespace == "fastpath" {
+                                                trace!(
+                                                    target = "transport.extension",
+                                                    transport_id,
+                                                    namespace = %frame.namespace,
+                                                    kind = %frame.kind,
+                                                    "viewer host-encoded extension ignored (fastpath not allowed)"
+                                                );
+                                                continue;
+                                            }
+                                            metrics::EXTENSION_RECEIVED
+                                                .with_label_values(&[
+                                                    &frame.namespace,
+                                                    &frame.kind,
+                                                    if is_controller_channel {
+                                                        "controller"
+                                                    } else {
+                                                        "viewer"
+                                                    },
+                                                ])
+                                                .inc();
+                                            extensions::publish(transport.id(), frame.clone());
+                                            trace!(
+                                                target = "transport.extension",
+                                                transport_id,
+                                                transport = ?transport_kind,
+                                                namespace = %frame.namespace,
+                                                kind = %frame.kind,
+                                                "received host-encoded extension frame"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    warn!(
                                         target = "sync::incoming",
-                                        session_id = %session_id,
                                         transport_id,
                                         transport = ?transport_kind,
                                         transport_sequence,
-                                        sentinel = %trimmed,
-                                        "received fast-path sentinel from manager"
-                                    );
-                                } else {
-                                    debug!(
-                                        target = "sync::incoming",
-                                        transport_id,
-                                        transport = ?transport_kind,
-                                        transport_sequence,
-                                        payload = %trimmed,
-                                        "ignoring unexpected text payload"
+                                        error = %err,
+                                        "failed to decode client frame"
                                     );
                                 }
                             }
                         }
+                        Payload::Text(text) => {
+                            let trimmed = text.trim();
+                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                                debug!(
+                                    target = "sync::incoming",
+                                    session_id = %session_id,
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    transport_sequence,
+                                    sentinel = %trimmed,
+                                    "received fast-path sentinel from manager"
+                                );
+                            } else {
+                                debug!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    transport_sequence,
+                                    payload = %trimmed,
+                                    "ignoring unexpected text payload"
+                                );
+                            }
+                        }
                     }
-                    Err(TransportError::Timeout) => continue,
-                    Err(TransportError::ChannelClosed) => {
-                        channel_closed = true;
-                        break;
-                    }
-                    Err(err) => {
-                        warn!(
-                            target = "sync::incoming",
-                            transport_id,
-                            transport = ?transport_kind,
-                            error = %err,
-                            "input listener error"
-                        );
-                        fatal_error = true;
-                        break;
-                    }
+                }
+                Err(TransportError::Timeout) => continue,
+                Err(TransportError::ChannelClosed) => {
+                    channel_closed = true;
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        target = "sync::incoming",
+                        transport_id,
+                        transport = ?transport_kind,
+                        error = %err,
+                        "input listener error"
+                    );
+                    fatal_error = true;
+                    break;
                 }
             }
         }
@@ -3663,70 +2955,95 @@ fn spawn_webrtc_acceptor(
                         join_code.clone(),
                     ));
                     let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+                    let label = metadata.label.clone().unwrap_or_default();
+                    let role = metadata.metadata.get("role").cloned().unwrap_or_default();
                     info!(
                         target = "transport.extension",
                         session_id = %session_id,
                         transport_id = %primary_transport.id().0,
+                        peer_id = %primary_transport.peer().0,
                         prefers_unified = unified_manager.prefers_unified(),
                         legacy_fastpath = unified_manager.supports_legacy_fastpath(),
-                        "evaluating unified fastpath bridge for negotiated transport"
+                        label,
+                        role,
+                        "evaluating unified bridge for negotiated transport"
                     );
 
-                    if unified_manager.prefers_unified() {
-                        let unified_bridge = Arc::new(
-                            UnifiedBuggyTransport::new_with_subscription(primary_transport.clone()),
-                        );
-                        unified_manager.set_bridge(unified_bridge.clone()).await;
+                    info!(
+                        target = "transport.extension",
+                        session_id = %session_id,
+                        transport_id = %primary_transport.id().0,
+                        peer_id = %primary_transport.peer().0,
+                        label,
+                        role,
+                        "attaching unified bridge to primary transport"
+                    );
+                    let unified_bridge = Arc::new(UnifiedBuggyTransport::new_with_subscription(
+                        primary_transport.clone(),
+                    ));
+                    unified_manager.set_bridge(unified_bridge.clone()).await;
+                    let should_attach_controller = true;
+                    if should_attach_controller {
+                        controller_ctx_clone.attach_state().mark_attached();
                         info!(
                             target = "transport.extension",
                             session_id = %session_id,
                             transport_id = %primary_transport.id().0,
-                            role = "host",
-                            "attached unified fastpath bridge to primary transport"
+                            label = metadata.label.as_deref().unwrap_or(""),
+                            role = %metadata_role(&metadata).unwrap_or_default(),
+                            "controller/manager bridge attached on primary transport (unified-only)"
                         );
-
-                        let mut ext_rx = primary_transport.subscribe_extensions("fastpath");
-                        let ingest_bridge = unified_bridge.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match ext_rx.recv().await {
-                                    Ok(frame) => {
-                                        let kind = frame.kind.clone();
-                                        ingest_bridge.ingest_extension_frame(frame);
-                                        trace!(
-                                            target = "transport.extension",
-                                            namespace = "fastpath",
-                                            kind = %kind,
-                                            role = "host",
-                                            "received fastpath extension frame"
-                                        );
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
-                                        skipped,
-                                    )) => {
-                                        warn!(
-                                            target = "transport.extension",
-                                            skipped, "fastpath extension subscriber lagged"
-                                        );
-                                        continue;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                        });
-
-                        let _ = spawn_unified_action_consumer(
-                            controller_ctx_clone.clone(),
-                            unified_bridge,
-                            writer.clone(),
-                        );
-                    } else {
-                        trace!(
+                        warn!(
                             target = "transport.extension",
                             session_id = %session_id,
-                            "manager extensions unsupported or disabled; using legacy paths"
+                            transport_id = %primary_transport.id().0,
+                            peer_id = %primary_transport.peer().0,
+                            label = metadata.label.as_deref().unwrap_or(""),
+                            role = %metadata_role(&metadata).unwrap_or_default(),
+                            "unified bridge marked controller-attached (forcing manager attach)"
                         );
                     }
+                    info!(
+                        target = "transport.extension",
+                        session_id = %session_id,
+                        transport_id = %primary_transport.id().0,
+                        role = "host",
+                        "attached unified fastpath bridge to primary transport"
+                    );
+
+                    let mut ext_rx = primary_transport.subscribe_extensions("manager");
+                    let ingest_bridge = unified_bridge.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match ext_rx.recv().await {
+                                Ok(frame) => {
+                                    let kind = frame.kind.clone();
+                                    ingest_bridge.ingest_extension_frame(frame);
+                                    trace!(
+                                        target = "transport.extension",
+                                        namespace = "fastpath",
+                                        kind = %kind,
+                                        role = "host",
+                                        "received fastpath extension frame"
+                                    );
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(
+                                        target = "transport.extension",
+                                        skipped, "fastpath extension subscriber lagged"
+                                    );
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+
+                    let _ = spawn_unified_action_consumer(
+                        controller_ctx_clone.clone(),
+                        unified_bridge,
+                        writer.clone(),
+                    );
 
                     info!(
                         target = "sync::acceptor",
@@ -3896,16 +3213,25 @@ fn spawn_webrtc_acceptor(
                     }
                     let primary_transport: Arc<dyn Transport> = shared_transport.clone();
 
-                    if unified_manager.prefers_unified()
-                        && matches!(
-                            metadata.label.as_deref(),
-                            Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
-                        )
-                    {
+                    if matches!(
+                        metadata.label.as_deref(),
+                        Some(CONTROLLER_CHANNEL_LABEL)
+                            | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+                            | Some(MANAGER_CHANNEL_LABEL)
+                    ) {
+                        info!(
+                            target = "transport.extension",
+                            session_id = %session_id,
+                            transport_id = %shared_transport.id().0,
+                            peer_id = %shared_transport.peer().0,
+                            label = metadata.label.as_deref().unwrap_or(""),
+                            "attaching unified bridge to controller transport (offerer supervisor)"
+                        );
                         let unified_bridge = Arc::new(
                             UnifiedBuggyTransport::new_with_subscription(primary_transport.clone()),
                         );
                         unified_manager.set_bridge(unified_bridge.clone()).await;
+                        controller_ctx_clone.attach_state().mark_attached();
                         info!(
                             target = "transport.extension",
                             session_id = %session_id,
@@ -3914,7 +3240,7 @@ fn spawn_webrtc_acceptor(
                             "attached unified fastpath bridge to offerer transport"
                         );
 
-                        let mut ext_rx = primary_transport.subscribe_extensions("fastpath");
+                        let mut ext_rx = primary_transport.subscribe_extensions("manager");
                         let ingest_bridge = unified_bridge.clone();
                         tokio::spawn(async move {
                             loop {
@@ -4166,7 +3492,6 @@ fn spawn_viewer_accept_loop(
                 guard.push(shared_transport.clone());
             }
             let shared_arc: Arc<dyn Transport> = shared_transport.clone();
-            let prefers_unified = unified_manager.prefers_unified();
             let bridge_exists = unified_manager.bridge().await.is_some();
 
             info!(
@@ -4174,31 +3499,38 @@ fn spawn_viewer_accept_loop(
                 session_id = %session_id,
                 peer_id = %peer_id,
                 label = ?auth_metadata.label,
-                prefers_unified,
                 bridge_exists,
-                "checking fastpath attachment conditions"
+                "checking unified attachment for incoming transport"
             );
 
-            if prefers_unified
-                && matches!(
-                    auth_metadata.label.as_deref(),
-                    Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
-                )
-            {
+            if is_manager_channel(&auth_metadata) {
                 if unified_manager.bridge().await.is_none() {
+                    info!(
+                        target = "transport.extension",
+                        session_id = %session_id,
+                        transport_id = %shared_arc.id().0,
+                        peer_id = %peer_id,
+                        label = auth_metadata.label.as_deref().unwrap_or(""),
+                        role_meta = %metadata_role(&auth_metadata).unwrap_or_default(),
+                        "attaching unified bridge to controller transport (viewer/offerer)"
+                    );
                     let unified_bridge = Arc::new(UnifiedBuggyTransport::new_with_subscription(
                         shared_arc.clone(),
                     ));
                     unified_manager.set_bridge(unified_bridge.clone()).await;
+                    controller_ctx.attach_state().mark_attached();
                     info!(
                         target = "transport.extension",
                         session_id = %session_id,
                         transport_id = %shared_arc.id().0,
                         role = "host",
-                        "attached unified fastpath bridge to viewer-offerer transport"
+                        label = auth_metadata.label.as_deref().unwrap_or(""),
+                        role_meta = %metadata_role(&auth_metadata).unwrap_or_default(),
+                        peer_id = %peer_id,
+                        "attached unified fastpath bridge to controller transport"
                     );
 
-                    let mut ext_rx = shared_arc.subscribe_extensions("fastpath");
+                    let mut ext_rx = shared_arc.subscribe_extensions("manager");
                     let ingest_bridge = unified_bridge.clone();
                     tokio::spawn(async move {
                         loop {
@@ -4577,6 +3909,28 @@ fn select_auto_attach_hint(
         .or_else(|| env.map(|hint| (hint, AutoAttachSource::Env)))
 }
 
+fn handle_auto_attach_decision(
+    metadata: Option<ControllerAutoAttachHint>,
+    env: Option<ControllerAutoAttachHint>,
+    session_id: &str,
+    attach_state: &Arc<ControllerAttachState>,
+) -> Option<(ControllerAutoAttachHint, AutoAttachSource)> {
+    match select_auto_attach_hint(metadata, env) {
+        Some(result) => Some(result),
+        None => {
+            // Default to unified attach so the controller consumer always binds on the unified transport;
+            // avoids relying on fragile metadata hints.
+            attach_state.mark_attached();
+            info!(
+                target = "controller.actions.attach",
+                session_id = %session_id,
+                "no controller auto-attach hint provided; defaulting to unified attach"
+            );
+            None
+        }
+    }
+}
+
 async fn trigger_auto_attach(
     hint: ControllerAutoAttachHint,
     source: AutoAttachSource,
@@ -4645,162 +3999,14 @@ async fn maybe_auto_attach_session(
     bearer_override: Option<String>,
 ) -> bool {
     let log_target = attach_log_target(source);
-    let handshake = matches!(source, AutoAttachSource::Handshake);
-    let bearer = match bearer_override {
-        Some(token) if !token.trim().is_empty() => token,
-        _ => match resolve_manager_bearer(&hint.manager_url).await {
-            Some(token) => token,
-            None => {
-                debug!(
-                    target = log_target,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    "skipping auto-attach; bearer token unavailable"
-                );
-                return false;
-            }
-        },
-    };
-
-    trace!(
+    let _ = (hint, session_id, bearer_override);
+    warn!(
         target = log_target,
-        session_id = %session_id,
-        private_beach_id = %hint.private_beach_id,
-        manager = %hint.manager_url,
         source = source.as_str(),
         attempt,
-        handshake,
-        "auto-attach attempt starting"
+        "auto-attach disabled (no host->manager HTTP)"
     );
-    let client = match Client::builder().build() {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(target = log_target, error = %err, "failed to build HTTP client for auto-attach");
-            return false;
-        }
-    };
-
-    let endpoint = format!(
-        "{}/private-beaches/{}/sessions/attach-by-code",
-        hint.manager_url.trim_end_matches('/'),
-        hint.private_beach_id
-    );
-    if handshake {
-        info!(
-            target = log_target,
-            session_id = %session_id,
-            private_beach_id = %hint.private_beach_id,
-            manager = %hint.manager_url,
-            source = source.as_str(),
-            attempt,
-            issued_at = hint.issued_at.as_deref().unwrap_or("unknown"),
-            expires_at = hint.expires_at.as_deref().unwrap_or("unspecified"),
-            "auto-attach via handshake"
-        );
-    } else {
-        info!(
-            target = log_target,
-            session_id = %session_id,
-            private_beach_id = %hint.private_beach_id,
-            manager = %hint.manager_url,
-            source = source.as_str(),
-            attempt,
-            issued_at = hint.issued_at.as_deref().unwrap_or("unknown"),
-            expires_at = hint.expires_at.as_deref().unwrap_or("unspecified"),
-            "attempting auto-attach via manager"
-        );
-    }
-
-    let mut request = client
-        .post(&endpoint)
-        .bearer_auth(bearer)
-        .json(&json!({ "session_id": session_id, "code": hint.attach_code }));
-    if let Some(handshake_id) = hint.handshake_id.as_deref() {
-        request = request.header(CONTROLLER_HANDSHAKE_HEADER, handshake_id);
-    }
-
-    match request.send().await {
-        Ok(response) if response.status().is_success() => {
-            if handshake {
-                info!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    attempt,
-                    "auto-attached via handshake"
-                );
-            } else {
-                info!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    attempt,
-                    "auto-attached session via manager"
-                );
-            }
-            true
-        }
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if handshake {
-                warn!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    status = %status,
-                    body = %body,
-                    attempt,
-                    "handshake auto-attach rejected"
-                );
-            } else {
-                warn!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    status = %status,
-                    body = %body,
-                    attempt,
-                    "auto-attach request rejected"
-                );
-            }
-            false
-        }
-        Err(err) => {
-            if handshake {
-                warn!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    error = %err,
-                    attempt,
-                    "handshake auto-attach request failed"
-                );
-            } else {
-                warn!(
-                    target = log_target,
-                    session_id = %session_id,
-                    private_beach_id = %hint.private_beach_id,
-                    manager = %hint.manager_url,
-                    source = source.as_str(),
-                    error = %err,
-                    attempt,
-                    "auto-attach request failed"
-                );
-            }
-            false
-        }
-    }
+    false
 }
 
 #[cfg(test)]
@@ -4826,15 +4032,16 @@ mod tests {
     use crate::transport::framed::FramedMessage;
     use crate::transport::{Payload, TransportKind, TransportPair};
     use axum::extract::{Path, State as AxumState};
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, StatusCode as AxumStatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
+    use reqwest::StatusCode as ReqStatusCode;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{Duration as StdDuration, Instant};
+    use std::time::{Duration as StdDuration, Instant, SystemTime};
     use tokio::io::BufReader;
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::net::TcpListener;
@@ -4902,6 +4109,56 @@ mod tests {
         assert_eq!(parsed.private_beach_id, "pb-456");
         assert_eq!(parsed.attach_code, "654321");
         assert_eq!(parsed.issued_at.as_deref(), Some("2025-02-02T12:34:56Z"));
+    }
+
+    #[tokio::test]
+    async fn manager_http_paths_are_disabled() {
+        let client = ManagerActionClient::new(
+            "http://example.com".into(),
+            ManagerActionAuth::Bearer("tok".into()),
+        )
+        .expect("construct client");
+        let err = client.receive_actions("sess").await.unwrap_err();
+        match err {
+            ManagerActionError::Status(code, _) => assert_eq!(code, ReqStatusCode::FORBIDDEN),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let err = client
+            .ack_actions(
+                "sess",
+                vec![CtrlActionAck {
+                    id: "a".into(),
+                    status: CtrlAckStatus::Ok,
+                    applied_at: SystemTime::now(),
+                    latency_ms: None,
+                    error_code: None,
+                    error_message: None,
+                }],
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ManagerActionError::Status(code, _) => assert_eq!(code, ReqStatusCode::FORBIDDEN),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_attach_short_circuits_without_http() {
+        let hint = ControllerAutoAttachHint {
+            private_beach_id: "pb".into(),
+            attach_code: "code".into(),
+            manager_url: "http://manager".into(),
+            issued_at: Some("2025-01-01T00:00:00Z".into()),
+            expires_at: None,
+            handshake_id: None,
+        };
+        let attached =
+            maybe_auto_attach_session(&hint, "sess", AutoAttachSource::Handshake, 1, None).await;
+        assert!(
+            !attached,
+            "auto attach should be disabled when HTTP is disallowed"
+        );
     }
 
     #[test]
@@ -5106,6 +4363,17 @@ mod tests {
             .expect("a hint should be selected");
         assert_eq!(source, AutoAttachSource::Metadata);
         assert_eq!(selected.private_beach_id, "pb-meta");
+    }
+
+    #[test]
+    fn handle_auto_attach_defaults_to_unified_without_hint() {
+        let attach_state = Arc::new(ControllerAttachState::new());
+        let result = handle_auto_attach_decision(None, None, "sess-no-hint", &attach_state);
+        assert!(result.is_none());
+        assert!(
+            attach_state.is_attached(),
+            "attach state should be marked attached when no hint is provided"
+        );
     }
 
     #[test]
@@ -6036,7 +5304,7 @@ mod tests {
                             !session_id.is_empty(),
                             "session path parameter should not be empty"
                         );
-                        StatusCode::OK
+                        AxumStatusCode::OK
                     },
                 ),
             )
@@ -6082,7 +5350,7 @@ mod tests {
 
         // Mark a fresh terminal update so the streamer sees new content.
         last_terminal_update.store(now_millis(), Ordering::Relaxed);
-        streamer.maybe_publish().await;
+        streamer.maybe_publish(true).await;
 
         timeout(StdDuration::from_secs(2), shared_state.notify.notified())
             .await

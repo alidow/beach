@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --experimental-vm-modules run.js"
+    "test": "node --experimental-vm-modules run.js",
+    "smoke": "node smoke.js"
   },
   "dependencies": {
     "crc-32": "^1.2.2",

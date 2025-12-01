@@ -7,6 +7,7 @@ import {
   connectBrowserTransport,
   type BrowserTransportConnection,
   type FallbackOverrides,
+  type IceRefreshContext,
 } from '../terminal/connect';
 import type { CellState, StyleDefinition, TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
 import { encodeKeyEvent } from '../terminal/keymap';
@@ -641,6 +642,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(!hideIdlePlaceholder);
   const [, setHeaderHeight] = useState<number>(0);
   const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
+  const [iceRefreshGeneration, setIceRefreshGeneration] = useState(0);
   const [peerId, setPeerId] = useState<string | null>(null);
   const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
   const [joinState, setJoinState] = useState<JoinOverlayState>('idle');
@@ -2041,6 +2043,17 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           log(message);
         };
 
+        const handleIceRefresh = (context: IceRefreshContext) => {
+          if (cancelled) {
+            return false;
+          }
+          markConnectionTrace('beach_terminal:ice_refresh_request', {
+            expiresAtMs: context.expiresAtMs ?? null,
+          });
+          setIceRefreshGeneration((value) => value + 1);
+          return false;
+        };
+
         markConnectionTrace('beach_terminal:transport_connect_start', { baseUrl, sessionId });
         const connection = await connectBrowserTransport({
           sessionId,
@@ -2050,6 +2063,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           clientLabel: queryLabel,
           fallbackOverrides,
           trace: connectionTraceRef.current,
+          onIceRefresh: handleIceRefresh,
         });
         markConnectionTrace('beach_terminal:transport_connect_success', {
           remotePeerId: connection.remotePeerId ?? null,
@@ -2114,7 +2128,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       finishConnectionTrace('cancelled', { reason: 'cleanup' });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoConnect, sessionId, baseUrl, passcode, queryLabel]);
+  }, [autoConnect, sessionId, baseUrl, passcode, queryLabel, iceRefreshGeneration]);
 
   const buildHostMeta = useCallback(
     (rect: DOMRectReadOnly): TerminalSizingHostMeta => {

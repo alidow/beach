@@ -81,6 +81,10 @@ type FollowTailDecision = {
 };
 
 function debugLog(message: string, detail?: Record<string, unknown>) {
+  if (typeof window !== 'undefined') {
+    const logs = (window as any).__BEACH_DEBUG_LOGS || ((window as any).__BEACH_DEBUG_LOGS = []);
+    logs.push({ timestamp: Date.now(), message, detail });
+  }
   if (typeof window === 'undefined') {
     return;
   }
@@ -104,9 +108,9 @@ function isSignalingTraceEnabled(): boolean {
   };
   return Boolean(
     host.__BEACH_TRACE ||
-      host.BEACH_TRACE ||
-      host.__BEACH_SIGNAL_TRACE ||
-      host.BEACH_SIGNAL_TRACE,
+    host.BEACH_TRACE ||
+    host.__BEACH_SIGNAL_TRACE ||
+    host.BEACH_SIGNAL_TRACE,
   );
 }
 
@@ -215,9 +219,9 @@ function summarizeStoreSnapshot(store: TerminalGridStore): SnapshotSummary | nul
       rowCount: snapshot.rows.length,
     };
   } catch (error) {
-      debugLog('followTail.snapshot_error', {
-        message: describeEventError(error, 'grid snapshot error'),
-      });
+    debugLog('followTail.snapshot_error', {
+      message: describeEventError(error, 'grid snapshot error'),
+    });
     return null;
   }
 }
@@ -471,6 +475,19 @@ function ensureEntryConnection(entry: ManagerEntry) {
             ? entry.params.effectiveAuthToken
             : undefined,
         trace: connectionTrace ?? undefined,
+        onIceRefresh: () => {
+          // Trigger an immediate reconnect with fresh TURN creds before expiry.
+          closeConnection(entry, 'ice_refresh');
+          detachListeners(entry);
+          entry.connection = null;
+          entry.transport = null;
+          entry.connecting = true;
+          entry.status = 'reconnecting';
+          entry.reconnectAttempts = 0;
+          notifySubscribers(entry);
+          scheduleReconnect(entry, { reason: 'ice_refresh', immediate: true });
+          return true;
+        },
       });
       if (entry.disposed) {
         connectionTrace?.finish('cancelled', { reason: 'entry-disposed' });
@@ -632,6 +649,10 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
   transport.addEventListener('open', openHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('open', openHandler as EventListener));
 
+  if (transport.isOpen()) {
+    openHandler();
+  }
+
   const secureHandler = (event: Event) => {
     const detail = (event as CustomEvent<SecureTransportSummary>).detail;
     entry.secureSummary = detail;
@@ -657,8 +678,8 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
       typeof (event as any)?.reason === 'string'
         ? String((event as any).reason)
         : typeof (event as any)?.detail?.reason === 'string'
-            ? String((event as any).detail.reason)
-            : null;
+          ? String((event as any).detail.reason)
+          : null;
     detachListeners(entry);
     entry.connection = null;
     entry.transport = null;
@@ -668,11 +689,18 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
     entry.lastCloseReason = describeEventError(eventReason ?? event, 'transport-close');
     notifySubscribers(entry);
     scheduleReconnect(entry, { reason: entry.lastCloseReason ?? undefined });
-    debugLog('transport.close', {
+    const closeLog = {
       key: entry.key,
       sessionId: entry.params.sessionId,
       reason: entry.lastCloseReason,
-    });
+      refCount: entry.refCount,
+      reconnectAttempts: entry.reconnectAttempts,
+      connecting: entry.connecting,
+      keepAlivePending: entry.keepAliveTimer != null,
+    };
+    debugLog('transport.close', closeLog);
+    // eslint-disable-next-line no-console
+    console.warn('[terminal-manager][transport.close]', closeLog);
   };
   transport.addEventListener('close', closeHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('close', closeHandler as EventListener));

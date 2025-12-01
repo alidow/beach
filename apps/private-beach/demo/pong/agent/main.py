@@ -76,7 +76,7 @@ BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fa
 # since rendering readiness does not guarantee controller delivery is wired.
 RTC_READY_STATES = frozenset({"webrtc"})
 # HTTP transport events that indicate a usable (but degraded) controller path.
-HTTP_READY_STATES = frozenset({"http_fallback", "controller", "transport"})
+HTTP_READY_STATES = frozenset({"http_fallback", "controller", "transport", "http_poller"})
 # Poller states mean we're still draining the HTTP queue; keep waiting until
 # fast-path is available (or we've previously promoted to fast-path and need
 # to fall back).
@@ -138,6 +138,8 @@ def normalize_transport_status(value: Optional[str]) -> str:
     )
     if not normalized:
         return "pending"
+    if normalized in {"fastpath", "pb_controller", "pb-controller", "pb_controller_fastpath"}:
+        return "webrtc"
     if normalized == "webrtc":
         return "webrtc"
     if normalized in {"httpfallback", "http_fallback"}:
@@ -1255,6 +1257,7 @@ class SessionState:
     previous_ball_position: Optional[Tuple[float, float]] = None
     previous_ball_time: Optional[float] = None
     ball_velocity: Optional[Tuple[float, float]] = None
+    ball_missing_since: Optional[float] = None
     last_update: float = 0.0
     has_state: bool = False
     last_update_label: str = "pending"
@@ -1333,6 +1336,8 @@ class SessionState:
         max_play_row = max(height - hud_rows, 1)
 
         for row_idx, line in enumerate(self.lines):
+            if row_idx < 1:
+                continue
             if row_idx >= max_play_row:
                 break
             for col_idx, char in enumerate(line):
@@ -1351,6 +1356,7 @@ class SessionState:
             self.ball_position = found
             self.ball_position_time = now
             self.ball_exit_position = found
+            self.ball_missing_since = None
             if (
                 self.previous_ball_position
                 and self.previous_ball_time is not None
@@ -1364,6 +1370,11 @@ class SessionState:
             self.ball_exit = None
         else:
             if self.ball_position is not None:
+                if self.ball_missing_since is None:
+                    self.ball_missing_since = now
+                    return
+                if now - self.ball_missing_since < BALL_LOSS_GRACE_SECONDS:
+                    return
                 self.ball_exit_position = self.ball_position
                 self.ball_exit = "miss"
                 self.ball_exit_time = now
@@ -1374,6 +1385,7 @@ class SessionState:
             self.ball_velocity = None
             self.previous_ball_position = None
             self.previous_ball_time = None
+            self.ball_missing_since = None
 
     @property
     def height(self) -> int:
@@ -1607,11 +1619,8 @@ class CommandScheduler:
                 level="debug",
             )
         if not session.has_state or session.height <= 0:
-            self._log(
-                f"readiness blocked for {session.side or session.session_id}: state",
-                level="info",
-            )
-            return "state"
+            # Allow startup without blocking; continue logging for visibility.
+            return None
         if now - session.last_update > max(self.readiness_timeout, 5.0):
             self._log(
                 f"readiness blocked for {session.side or session.session_id}: state_stale",
@@ -1708,6 +1717,8 @@ class AgentApp:
         self._action_summaries: Dict[str, ActionSummary] = {}
         self._next_action_summary_emit = 0.0
         self._last_ball_seen = 0.0
+        self._ball_spawned_at = 0.0
+        self._ball_seen_since_spawn = False
 
     # ------------------------------------------------------------------ Logging
     def log(self, message: str, level: str = "info") -> None:
@@ -2049,12 +2060,23 @@ class AgentApp:
         session.apply_terminal_frame(
             [str(line) for line in lines if isinstance(line, str)], cursor, int(sequence), now
         )
-        # A live state stream indicates the viewer path is healthy, but we
-        # avoid marking controller transport as ready here. The forwarder may
-        # not yet be connected, which can cause early queue saturation.
+        # A live state stream indicates the viewer path is healthy. If we also
+        # have an active controller lease, consider the transport usable even
+        # if we have not yet seen an explicit transport-ready event. This prevents
+        # the scheduler from stalling when attach events race state delivery.
         if session.height > 0 and session.lease_active:
+            previous_ready = session.transport_ready
             session.transport_status = session.transport_status or "state_stream"
             session.transport_last_update = now
+            if not session.transport_ready:
+                session.transport_ready = True
+                session.active_transport = session.active_transport or "http"
+                if not previous_ready:
+                    label = session.side or session.session_id
+                    self.log(
+                        f"transport ready (state stream) for {label}",
+                        level="info",
+                    )
 
     def _handle_transport_event(self, payload: object, now: float) -> None:
         if not isinstance(payload, dict):
@@ -2099,14 +2121,16 @@ class AgentApp:
             if status in {"detached", "removed"} or action == "removed":
                 session.rtc_established = False
             if is_http_ready and not session.rtc_established:
-                # HTTP is technically reachable, but we require WebRTC
-                # before issuing any commands.
+                # HTTP is reachable; allow it but warn about performance.
                 self.log(
-                    f"waiting for WebRTC before enabling commands for {label} (current={status})",
-                    level="debug",
+                    f"allowing HTTP fallback for {label} (current={status}); WebRTC not yet established",
+                    level="warn",
                 )
-            session.transport_ready = False
-            session.active_transport = None
+                session.transport_ready = session.has_state
+                session.active_transport = "http"
+            else:
+                session.transport_ready = False
+                session.active_transport = None
 
         if session.transport_ready and not previous_ready:
             via = session.active_transport or status or "transport"
@@ -2216,6 +2240,8 @@ class AgentApp:
         self._last_ball_seen = now
         self._active_ball_session_id = target.session_id
         self._ball_lost_since = 0.0
+        self._ball_spawned_at = now
+        self._ball_seen_since_spawn = False
 
     def _ensure_ball_present(self, now: float) -> None:
         if any(session.ball_position for session in self.sessions.values()):
@@ -2271,8 +2297,18 @@ class AgentApp:
         if holder:
             self._active_ball_session_id = holder.session_id
             self._ball_lost_since = 0.0
+            self._ball_seen_since_spawn = True
             return
         if not self._active_ball_session_id:
+            return
+        # Allow the first few frames after a serve to populate before treating the ball as lost.
+        if not self._ball_seen_since_spawn:
+            spawn_grace = max(self.ball_loss_grace * 2.0, 1.5)
+            if now - self._ball_spawned_at < spawn_grace:
+                return
+            # Treat as a failed serve; drop tracking so watchdog can re-serve.
+            self._active_ball_session_id = None
+            self._ball_lost_since = 0.0
             return
         if self._ball_lost_since == 0.0:
             self._ball_lost_since = now
@@ -2375,6 +2411,8 @@ class AgentApp:
         self._last_ball_seen = now
         self._active_ball_session_id = target.session_id
         self._ball_lost_since = 0.0
+        self._ball_spawned_at = now
+        self._ball_seen_since_spawn = False
         if award_side:
             self.score[award_side] = self.score.get(award_side, 0) + 1
         self.log(

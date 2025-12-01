@@ -1,7 +1,8 @@
 use axum::{
     async_trait,
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    body::Body,
+    extract::{rejection::JsonRejection, FromRequest, Path, Query, State},
+    http::{HeaderMap, Request},
     Json,
 };
 use chrono::Utc;
@@ -247,6 +248,28 @@ impl CanvasLayout {
         }
         self.metadata.updated_at = now_ms;
         self
+    }
+}
+
+/// JSON extractor that logs deserialization failures for canvas layout writes.
+pub struct LoggedJson<T>(pub T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for LoggedJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = JsonRejection;
+
+    async fn from_request(req: Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(LoggedJson(value)),
+            Err(err) => {
+                warn!(target = "layout", error = %err, "layout payload rejected");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -1276,7 +1299,7 @@ pub async fn put_private_beach_layout(
     State(state): State<AppState>,
     token: AuthToken,
     Path(id): Path<String>,
-    Json(body): Json<CanvasLayout>,
+    LoggedJson(body): LoggedJson<CanvasLayout>,
 ) -> ApiResult<CanvasLayout> {
     ensure_scope(&token, "pb:beaches.write")?;
     let layout = state

@@ -56,6 +56,7 @@ snow = "0.9"
 beach-lifeguard-client = { path = "../beach-lifeguard/client" }
 beach-lifeguard-core = { path = "../beach-lifeguard/core" }
 beach-buggy = { path = "../../crates/beach-buggy" }
+transport-bus = { path = "../../crates/transport-bus" }
 time = { version = "0.3", features = ["serde"] }
 hex = "0.4"
 directories = "5"
@@ -65,6 +66,7 @@ toml = "0.8"
 prometheus = "0.13"
 crc32c = "0.6"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server"] }

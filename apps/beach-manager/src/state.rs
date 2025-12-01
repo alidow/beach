@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fmt,
+    env, fmt,
     net::IpAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,14 +24,17 @@ use crate::{
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
+use base64::{engine::general_purpose, Engine as _};
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
     HealthHeartbeat, RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition,
     StyledCell, TerminalFrame, TransportMode,
 };
+use beach_client_core::auth::config::AuthConfig as GateAuthConfig;
+use beach_client_core::auth::gate::{BeachGateClient, TurnIceServer};
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
-use beach_client_core::transport::webrtc::warm_session_key;
+use beach_client_core::transport::webrtc::{transport_diagnostics, warm_session_key};
 use beach_client_core::transport::{extensions, framed};
 use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
@@ -40,9 +43,12 @@ use beach_client_core::{
     Transport, TransportError, TransportKind, TransportOffer, WebRtcChannels,
 };
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha1::Sha1;
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -111,6 +117,42 @@ fn manager_bearer_token() -> Option<String> {
     None
 }
 
+fn build_gate_client(gate_url: Option<String>) -> Option<BeachGateClient> {
+    let mut config = match GateAuthConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "unable to load Beach Gate auth config; TURN credentials will be unavailable"
+            );
+            return None;
+        }
+    };
+    if let Some(url) = gate_url.or_else(|| std::env::var("BEACH_GATE_URL").ok()) {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            match Url::parse(trimmed) {
+                Ok(parsed) => config.gateway = parsed,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        gate_url = trimmed,
+                        "invalid Beach Gate url; TURN credentials will be unavailable"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+    match BeachGateClient::new(config) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(error = %err, "failed to initialize Beach Gate client");
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StateKeepaliveManager {
     tasks: Arc<RwLock<HashMap<String, StateHeartbeatHandle>>>,
@@ -133,6 +175,7 @@ pub struct AppState {
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
     controller_workers: Arc<RwLock<HashMap<String, ControllerForwarderWorker>>>,
     viewer_tokens: Option<ViewerTokenClient>,
+    gate_client: Option<BeachGateClient>,
     http: reqwest::Client,
     road_base_url: String,
     public_manager_url: String,
@@ -247,6 +290,7 @@ struct ControllerLeaseMemory {
 struct ViewerWorker {
     handle: JoinHandle<()>,
     cancel: CancellationToken,
+    peer_id: String,
 }
 
 struct ControllerForwarderWorker {
@@ -1198,6 +1242,7 @@ impl AppState {
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
+            gate_client: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -1230,6 +1275,7 @@ impl AppState {
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
+            gate_client: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -1278,6 +1324,11 @@ impl AppState {
         if let (Some(url), Some(token)) = (gate_url, service_token) {
             self.viewer_tokens = Some(ViewerTokenClient::new(url, token));
         }
+        self
+    }
+
+    pub fn with_gate_client(mut self, gate_url: Option<String>) -> Self {
+        self.gate_client = build_gate_client(gate_url);
         self
     }
 
@@ -1892,73 +1943,14 @@ impl AppState {
             "payload": handshake,
         });
 
-        let dispatch_started = Instant::now();
-        let skip_http = std::env::var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP")
-            .ok()
-            .map(|value| {
-                let trimmed = value.trim().to_ascii_lowercase();
-                trimmed == "1" || trimmed == "true"
-            })
-            .unwrap_or(false);
-
-        if skip_http {
-            info!(
-                target = "controller.actions",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "skipping manager handshake HTTP dispatch via test override"
-            );
-            self.mark_controller_handshake_dispatched(session_id, handshake_control_id)
-                .await;
-            return Ok(());
-        }
-
-        match self.http.post(url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    private_beach_id = %private_beach_id,
-                    "manager handshake dispatched via control channel"
-                );
-                self.mark_controller_handshake_dispatched(session_id, handshake_control_id)
-                    .await;
-                if should_log_custom_event(
-                    "manager_handshake_dispatch",
-                    session_id,
-                    StdDuration::from_secs(15),
-                ) {
-                    trace!(
-                        target = "controller.actions",
-                        session_id = %session_id,
-                        private_beach_id = %private_beach_id,
-                        wait_ms = dispatch_started.elapsed().as_millis() as u64,
-                        "manager handshake HTTP dispatch completed"
-                    );
-                }
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let detail = resp.text().await.unwrap_or_default();
-                warn!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    private_beach_id = %private_beach_id,
-                    status = %status,
-                    error = %detail,
-                    "failed to enqueue manager handshake"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    private_beach_id = %private_beach_id,
-                    error = %err,
-                    "failed to send manager handshake"
-                );
-            }
-        }
+        info!(
+            target = "controller.actions",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            "manager handshake prepared for wss dispatch only (HTTP disabled)"
+        );
+        self.mark_controller_handshake_dispatched(session_id, handshake_control_id)
+            .await;
 
         Ok(())
     }
@@ -2753,6 +2745,87 @@ impl AppState {
         let text = response.text().await?;
         let payload: JoinSessionResponsePayload = serde_json::from_str(&text)?;
         Ok((status, payload))
+    }
+
+    pub async fn gate_turn_credentials(&self) -> Option<(Vec<TurnIceServer>, i64)> {
+        let client = self.gate_client.as_ref()?;
+        let bearer = manager_bearer_token()?;
+        let trimmed = bearer.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let creds = match client.turn_credentials(trimmed).await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(error = %err, "Beach Gate TURN credentials fetch failed");
+                return None;
+            }
+        };
+
+        let expires_at_ms = creds
+            .expires_at
+            .map(|value| value.saturating_mul(1000))
+            .unwrap_or_else(|| {
+                let ttl_ms: i64 = creds.ttl_seconds.saturating_mul(1000) as i64;
+                now_ms() + ttl_ms
+            });
+        let ice_servers: Vec<TurnIceServer> = creds
+            .ice_servers
+            .into_iter()
+            .filter(|server| !server.urls.is_empty())
+            .collect();
+        if ice_servers.is_empty() {
+            warn!("Beach Gate returned empty TURN servers; skipping attach");
+            return None;
+        }
+        Some((ice_servers, expires_at_ms))
+    }
+
+    pub async fn gate_turn_credentials_or_dev_fallback(&self) -> Option<(Vec<TurnIceServer>, i64)> {
+        if let Some(value) = self.gate_turn_credentials().await {
+            return Some(value);
+        }
+        // Dev fallback: allow generating TURN creds locally when manager bearer is missing/invalid and insecure token is allowed.
+        if std::env::var("DEV_ALLOW_INSECURE_MANAGER_TOKEN").unwrap_or_default() != "1" {
+            return None;
+        }
+        let urls_env = std::env::var("BEACH_GATE_TURN_URLS").ok()?;
+        let urls: Vec<String> = urls_env
+            .split(',')
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if urls.is_empty() {
+            return None;
+        }
+        let secret = std::env::var("BEACH_GATE_TURN_SECRET").ok()?;
+        let ttl_seconds: i64 = std::env::var("BEACH_GATE_TURN_TTL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(14_400);
+        let expires_at_ms = now_ms() + ttl_seconds.saturating_mul(1000);
+        let username = format!("{}:dev", expires_at_ms / 1000);
+
+        type HmacSha1 = Hmac<Sha1>;
+        let mut mac = match HmacSha1::new_from_slice(secret.as_bytes()) {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(error = %err, "failed to init HMAC for dev TURN creds");
+                return None;
+            }
+        };
+        mac.update(username.as_bytes());
+        let credential = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        let ice_servers = vec![TurnIceServer {
+            urls,
+            username: Some(username),
+            credential: Some(credential),
+            credential_type: Some("password".into()),
+        }];
+
+        Some((ice_servers, expires_at_ms))
     }
 
     pub async fn update_session_metadata(
@@ -4519,10 +4592,20 @@ impl AppState {
         };
 
         let base_url = self.road_base_url.clone();
-        if let Some(existing) = {
-            let mut workers = self.viewer_workers.write().await;
-            workers.remove(session_id)
-        } {
+        let mut workers = self.viewer_workers.write().await;
+        if let Some(existing) = workers.get(session_id) {
+            if !existing.handle.is_finished() {
+                // A viewer worker is already running; keep it alive and avoid spawning another.
+                return Ok(());
+            }
+        }
+
+        let viewer_peer_id = workers
+            .get(session_id)
+            .map(|worker| worker.peer_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        if let Some(existing) = workers.remove(session_id) {
             existing.cancel.cancel();
             let handle = existing.handle;
             tokio::spawn(async move {
@@ -4537,6 +4620,7 @@ impl AppState {
         let join_code_owned = join_code.clone();
         let base_url_owned = base_url.clone();
         let cancel_clone = cancel.clone();
+        let viewer_peer_id_owned = viewer_peer_id.clone();
         let handle = tokio::spawn(async move {
             run_viewer_worker(
                 state_clone,
@@ -4544,13 +4628,76 @@ impl AppState {
                 private_beach_id_owned,
                 join_code_owned,
                 base_url_owned,
+                viewer_peer_id_owned,
                 cancel_clone,
             )
             .await;
         });
-        let mut workers = self.viewer_workers.write().await;
-        workers.insert(session_id.to_string(), ViewerWorker { handle, cancel });
+        workers.insert(
+            session_id.to_string(),
+            ViewerWorker {
+                handle,
+                cancel,
+                peer_id: viewer_peer_id,
+            },
+        );
         Ok(())
+    }
+
+    async fn record_timeline_event(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        peer_id: &str,
+        event: &str,
+        detail: serde_json::Value,
+    ) {
+        if !timeline_logging_enabled() {
+            return;
+        }
+        let Some(client) = &self.redis else {
+            return;
+        };
+        let entry = json!({
+            "ts_ms": Utc::now().timestamp_millis(),
+            "event": event,
+            "detail": detail,
+        });
+        let key = redis_timeline_key(private_beach_id, session_id, peer_id);
+        let mut conn = match client.get_async_connection().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                debug!(
+                    target = "private_beach",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    peer_id = %peer_id,
+                    error = %err,
+                    "timeline redis connection failed"
+                );
+                return;
+            }
+        };
+        let res: Result<(), redis::RedisError> = redis::pipe()
+            .cmd("LPUSH")
+            .arg(&key)
+            .arg(entry.to_string())
+            .cmd("LTRIM")
+            .arg(&key)
+            .arg(0)
+            .arg(200)
+            .query_async(&mut conn)
+            .await;
+        if let Err(err) = res {
+            debug!(
+                target = "private_beach",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                peer_id = %peer_id,
+                error = %err,
+                "timeline redis write failed"
+            );
+        }
     }
 
     pub async fn spawn_controller_forwarder(&self, session_id: &str) -> Result<(), StateError> {
@@ -5881,6 +6028,17 @@ fn redis_state_key(private_beach_id: &str, session_id: &str) -> String {
 
 fn redis_action_index_key(private_beach_id: &str, session_id: &str) -> String {
     format!("pb:{private_beach_id}:sess:{session_id}:actions:index")
+}
+
+fn redis_timeline_key(private_beach_id: &str, session_id: &str, peer_id: &str) -> String {
+    format!("pb:{private_beach_id}:sess:{session_id}:timeline:{peer_id}")
+}
+
+fn timeline_logging_enabled() -> bool {
+    matches!(
+        std::env::var("BEACH_TIMELINE_REDIS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
+    )
 }
 
 fn parse_pending_entries(value: redis::Value) -> Vec<String> {
@@ -7896,6 +8054,7 @@ async fn run_viewer_worker(
     private_beach_id: String,
     join_code: String,
     road_base_url: String,
+    viewer_peer_id: String,
     cancel: CancellationToken,
 ) {
     #[cfg(test)]
@@ -7906,6 +8065,7 @@ async fn run_viewer_worker(
             private_beach_id,
             join_code,
             road_base_url,
+            viewer_peer_id,
         )
         .await;
         return;
@@ -7918,6 +8078,7 @@ async fn run_viewer_worker(
         .with_label_values(&[label_private.as_str(), label_session.as_str()])
         .set(0);
     let mut attempts: usize = 0;
+    let mut last_error: Option<String> = None;
     loop {
         if cancel.is_cancelled() {
             info!(
@@ -7934,6 +8095,31 @@ async fn run_viewer_worker(
                 .inc();
         }
         attempts = attempts.saturating_add(1);
+        let ice_env = [
+            (
+                "BEACH_GATE_TURN_URLS",
+                env::var("BEACH_GATE_TURN_URLS").ok(),
+            ),
+            (
+                "BEACH_TURN_EXTERNAL_IP",
+                env::var("BEACH_TURN_EXTERNAL_IP").ok(),
+            ),
+            ("BEACH_ICE_PUBLIC_IP", env::var("BEACH_ICE_PUBLIC_IP").ok()),
+            (
+                "BEACH_ICE_PUBLIC_HOST",
+                env::var("BEACH_ICE_PUBLIC_HOST").ok(),
+            ),
+        ];
+        info!(
+            target = "private_beach",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            viewer_peer_id = %viewer_peer_id,
+            attempt = attempts,
+            ice_env = ?ice_env,
+            last_error = last_error.as_deref().unwrap_or("none"),
+            "manager viewer starting connect attempt"
+        );
         match viewer_connect_once(
             &state,
             &session_id,
@@ -7941,6 +8127,8 @@ async fn run_viewer_worker(
             &join_code,
             &road_base_url,
             label,
+            &viewer_peer_id,
+            attempts,
             cancel.clone(),
         )
         .await
@@ -7950,17 +8138,45 @@ async fn run_viewer_worker(
                     target = "private_beach",
                     session_id = %session_id,
                     private_beach_id = %private_beach_id,
+                    viewer_peer_id = %viewer_peer_id,
+                    attempt = attempts,
                     "manager viewer disconnected cleanly"
                 );
+                state
+                    .record_timeline_event(
+                        &private_beach_id,
+                        &session_id,
+                        &viewer_peer_id,
+                        "disconnect_clean",
+                        json!({ "attempt": attempts }),
+                    )
+                    .await;
+                last_error = None;
             }
             Err(err) => {
+                let err_str = err.to_string();
                 warn!(
                     target = "private_beach",
                     session_id = %session_id,
                     private_beach_id = %private_beach_id,
+                    viewer_peer_id = %viewer_peer_id,
+                    attempt = attempts,
                     error = %err,
                     "manager viewer connection failed"
                 );
+                state
+                    .record_timeline_event(
+                        &private_beach_id,
+                        &session_id,
+                        &viewer_peer_id,
+                        "connect_failed",
+                        json!({
+                            "attempt": attempts,
+                            "error": err_str,
+                        }),
+                    )
+                    .await;
+                last_error = Some(err_str);
             }
         }
         metrics::MANAGER_VIEWER_CONNECTED
@@ -7984,6 +8200,8 @@ async fn viewer_connect_once(
     join_code: &str,
     road_base_url: &str,
     label: &str,
+    viewer_peer_id: &str,
+    attempt: usize,
     cancel: CancellationToken,
 ) -> Result<(), ViewerError> {
     let gauge =
@@ -7992,6 +8210,19 @@ async fn viewer_connect_once(
     let gauge_guard = ViewerGaugeGuard::new(gauge.clone());
     let latency_hist =
         metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[private_beach_id, session_id]);
+
+    state
+        .record_timeline_event(
+            private_beach_id,
+            session_id,
+            viewer_peer_id,
+            "connect_start",
+            json!({
+                "attempt": attempt,
+                "label": label,
+            }),
+        )
+        .await;
 
     if cancel.is_cancelled() {
         return Ok(());
@@ -8031,7 +8262,8 @@ async fn viewer_connect_once(
     rewrite_loopback_transports(&mut handle, &fallback_base)?;
     let mut attach_metadata = HashMap::new();
     attach_metadata.insert("role".into(), "viewer".into());
-    attach_metadata.insert("peer_id".into(), Uuid::new_v4().to_string());
+    attach_metadata.insert("peer_id".into(), viewer_peer_id.to_string());
+    attach_metadata.insert("attempt".into(), attempt.to_string());
     let negotiated = negotiate_transport(
         &handle,
         Some(join_code),
@@ -8054,6 +8286,18 @@ async fn viewer_connect_once(
         private_beach_id = %private_beach_id,
         "manager viewer connected via webrtc"
     );
+    state
+        .record_timeline_event(
+            private_beach_id,
+            session_id,
+            viewer_peer_id,
+            "connect_ok",
+            json!({
+                "attempt": attempt,
+                "transport": "webrtc",
+            }),
+        )
+        .await;
     gauge_guard.mark_connected();
 
     if cancel.is_cancelled() {
@@ -8115,24 +8359,51 @@ async fn viewer_connect_once(
                         Ok(frame) => {
                             let report_health = matches!(frame, WireHostFrame::Heartbeat { .. })
                                 && viewer_state.claim_health_report_slot(Instant::now());
-                            let frame_type = match &frame {
-                                WireHostFrame::Hello { .. } => "hello",
-                                WireHostFrame::Grid { .. } => "grid",
-                                WireHostFrame::Snapshot { .. } => "snapshot",
-                                WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
-                                WireHostFrame::Delta { .. } => "delta",
-                                WireHostFrame::HistoryBackfill { .. } => "history_backfill",
-                                WireHostFrame::InputAck { .. } => "input_ack",
-                                WireHostFrame::Cursor { .. } => "cursor",
-                                WireHostFrame::Heartbeat { .. } => "heartbeat",
-                                WireHostFrame::Extension { .. } => "extension",
-                                WireHostFrame::Shutdown => "shutdown",
+                            let frame_kind = match &frame {
+                                WireHostFrame::Hello { subscription, .. } => {
+                                    format!("hello:subscription={subscription}")
+                                }
+                                WireHostFrame::Grid {
+                                    cols,
+                                    history_rows,
+                                    base_row,
+                                    viewport_rows,
+                                } => format!(
+                                    "grid:cols={cols},history_rows={history_rows},base_row={base_row:?},viewport_rows={viewport_rows:?}"
+                                ),
+                                WireHostFrame::Snapshot { updates, .. } => {
+                                    format!("snapshot:updates={}", updates.len())
+                                }
+                                WireHostFrame::SnapshotComplete { .. } => {
+                                    "snapshot_complete".to_string()
+                                }
+                                WireHostFrame::Delta { updates, .. } => {
+                                    format!("delta:updates={}", updates.len())
+                                }
+                                WireHostFrame::HistoryBackfill { updates, .. } => {
+                                    format!("history_backfill:updates={}", updates.len())
+                                }
+                                WireHostFrame::InputAck { .. } => "input_ack".to_string(),
+                                WireHostFrame::Cursor { .. } => "cursor".to_string(),
+                                WireHostFrame::Heartbeat { .. } => "heartbeat".to_string(),
+                                WireHostFrame::Extension { .. } => "extension".to_string(),
+                                WireHostFrame::Shutdown => "shutdown".to_string(),
                             };
                             debug!(
                                 target = "private_beach",
                                 session_id = %session_id,
-                                frame = frame_type,
+                                private_beach_id = %private_beach_id,
+                                frame = frame_kind,
+                                bytes = bytes.len(),
                                 "manager viewer received host frame"
+                            );
+                            trace!(
+                                target = "private_beach.frames",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                raw_len = bytes.len(),
+                                frame = ?frame,
+                                "manager viewer decoded host frame content"
                             );
                             if let WireHostFrame::Heartbeat { timestamp_ms, .. } = &frame {
                                 let now_ms = SystemTime::now()
@@ -8173,17 +8444,37 @@ async fn viewer_connect_once(
                                     }
                                 }
                             }
-                            if let Some(diff) = viewer_state.handle_host_frame(&frame) {
-                                let sequence = diff.sequence;
-                                if let Err(err) = state.record_state(session_id, diff, false).await
-                                {
-                                    warn!(
+                            match viewer_state.handle_host_frame(&frame) {
+                                Some(diff) => {
+                                    let sequence = diff.sequence;
+                                    trace!(
                                         target = "private_beach",
                                         session_id = %session_id,
                                         private_beach_id = %private_beach_id,
-                                        error = %err,
-                                        sequence,
-                                        "manager viewer failed to persist diff"
+                                        seq = sequence,
+                                        status = "diff_produced",
+                                        "manager viewer produced state diff"
+                                    );
+                                    if let Err(err) =
+                                        state.record_state(session_id, diff, false).await
+                                    {
+                                        warn!(
+                                            target = "private_beach",
+                                            session_id = %session_id,
+                                            private_beach_id = %private_beach_id,
+                                            error = %err,
+                                            sequence,
+                                            "manager viewer failed to persist diff"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    trace!(
+                                        target = "private_beach",
+                                        session_id = %session_id,
+                                        private_beach_id = %private_beach_id,
+                                        status = "consumed_no_diff",
+                                        "manager viewer consumed frame without diff"
                                     );
                                 }
                             }
@@ -8212,11 +8503,18 @@ async fn viewer_connect_once(
                             }
                         }
                         Err(err) => {
+                            let truncated = if bytes.len() > 64 {
+                                format!("{} bytes (first 64: {:02x?} …)", bytes.len(), &bytes[..64])
+                            } else {
+                                format!("{} bytes: {:02x?}", bytes.len(), bytes.as_slice())
+                            };
                             warn!(
                                 target = "private_beach",
                                 session_id = %session_id,
                                 private_beach_id = %private_beach_id,
                                 error = %err,
+                                payload = %truncated,
+                                status = "decode_failed",
                                 "manager viewer failed to decode host frame"
                             );
                         }
@@ -8823,6 +9121,9 @@ async fn drive_controller_forwarder(
     let mut next_seq: u64 = 0;
     let mut idle_delay = tokio::time::interval(StdDuration::from_millis(200));
     idle_delay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_ack_at: Option<Instant> = None;
+    let mut last_ack_transport: Option<String> = None;
+    let mut last_send_at: Option<Instant> = None;
 
     // If fast-path appears healthy (sends succeed) but no acknowledgements are
     // observed for an extended period, treat the transport as stalled and
@@ -8889,8 +9190,10 @@ async fn drive_controller_forwarder(
             event = event_rx.recv() => {
                 match event {
                     Some(ForwarderEvent::Ack(seq)) => {
+                        let inflight_before = pending.len();
                         if let Some(pending_action) = pending.remove(&seq) {
                             let latency = pending_action.sent_at.elapsed().as_millis() as u64;
+                            let inflight_after = pending.len();
                             let ack = ActionAck {
                                 id: pending_action.action.id.clone(),
                                 status: AckStatus::Ok,
@@ -8899,6 +9202,8 @@ async fn drive_controller_forwarder(
                                 error_code: None,
                                 error_message: None,
                             };
+                            last_ack_at = Some(Instant::now());
+                            last_ack_transport = Some(transport_label.to_string());
                             state
                                 .ack_actions(session_id, vec![ack], None, via_fast_path)
                                 .await?;
@@ -8913,6 +9218,9 @@ async fn drive_controller_forwarder(
                                 action_id = %pending_action.action.id,
                                 seq,
                                 transport = transport_label,
+                                transport_id = %transport.id().0,
+                                inflight_before,
+                                inflight_after,
                                 "controller action acked"
                             );
                         } else {
@@ -8926,9 +9234,24 @@ async fn drive_controller_forwarder(
                         }
                     }
                     Some(ForwarderEvent::AckById(ack)) => {
+                        let inflight_before = pending.len();
                         let removed_seq = remove_pending_by_id(&mut pending, &ack.id);
                         if removed_seq.is_some() {
                             metrics::ACTIONS_ACKED.with_label_values(&labels).inc();
+                            last_ack_at = Some(Instant::now());
+                            last_ack_transport = Some(transport_label.to_string());
+                            debug!(
+                                target = "controller.delivery",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                action_id = %ack.id,
+                                seq = removed_seq,
+                                transport = transport_label,
+                                transport_id = %transport.id().0,
+                                inflight_before,
+                                inflight_after = pending.len(),
+                                "controller action acked by id"
+                            );
                         } else {
                             trace!(
                                 target = "controller.forwarder",
@@ -9086,44 +9409,44 @@ async fn drive_controller_forwarder(
                                 "no action acknowledgements for >{:?}; treating as stalled",
                                 ACK_STALL_DEADLINE
                             );
+                            let now = Instant::now();
+                            let diag = transport_diagnostics(transport.id());
+                            let stall_snapshot = serde_json::json!({
+                                "inflightByTransport": { transport_label: inflight },
+                                "lastAckTransport": last_ack_transport.clone(),
+                                "lastAckAgeMs": last_ack_at.as_ref().map(|ts| now.saturating_duration_since(*ts).as_millis()),
+                                "lastSendAgeMs": last_send_at.as_ref().map(|ts| now.saturating_duration_since(*ts).as_millis()),
+                                "bufferedAmount": diag.as_ref().and_then(|d| d.last_buffered_amount),
+                                "bufferedHighWater": diag.as_ref().map(|d| d.buffered_high_water),
+                                "channel": diag.as_ref().and_then(|d| d.channel_label.clone()),
+                                "pcState": diag.as_ref().and_then(|d| d.last_pc_state.clone()),
+                                "iceState": diag.as_ref().and_then(|d| d.last_ice_state.clone()),
+                                "transportId": transport.id().0,
+                            });
                             fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
-                            if via_fast_path {
-                                warn!(
-                                    target = "controller.forwarder",
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    inflight,
-                                    transport = transport_label,
-                                    "ack stall detected; falling back to primary transport"
-                                );
-                                state
-                                    .emit_host_devtools_event(
-                                        session_id,
-                                        "host.transport:ack-stall",
-                                        DevtoolsEventLevel::Warn,
-                                        Some(serde_json::json!({
-                                            "inflight": inflight,
-                                            "transport": transport_label,
-                                            "deadlineMs": ACK_STALL_DEADLINE.as_millis(),
-                                        })),
-                                    )
-                                    .await;
-                                via_fast_path = false;
-                                transport_label = "http_fallback";
-                                transport = primary_transport.clone();
-                                drop(reader_guard);
-                                reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                                state
-                                    .update_pairing_transport_status(
-                                        session_id,
-                                        PairingTransportStatus::http_fallback(
-                                            now_ms(),
-                                            Some("ack_stall".into()),
-                                        ),
-                                    )
-                                    .await;
-                                continue;
-                            }
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                inflight,
+                                stall_snapshot = ?stall_snapshot,
+                                transport = transport_label,
+                                "ack stall detected on unified transport; stopping forwarder"
+                            );
+                            state
+                                .emit_host_devtools_event(
+                                    session_id,
+                                    "host.transport:ack-stall",
+                                    DevtoolsEventLevel::Error,
+                                    Some(serde_json::json!({
+                                        "inflight": inflight,
+                                        "transport": transport_label,
+                                        "deadlineMs": ACK_STALL_DEADLINE.as_millis(),
+                                        "stallSnapshot": stall_snapshot,
+                                    })),
+                                )
+                                .await;
+                            return Err(ControllerForwarderError::Transport(reason));
                         }
                     }
                 }
@@ -9167,6 +9490,7 @@ async fn drive_controller_forwarder(
                     let action_id = action.id.clone();
                     match action_terminal_bytes(&action) {
                         Ok(bytes) => {
+                            let inflight_before = pending.len();
                             next_seq = next_seq.saturating_add(1);
                             let controller_payload = match serde_json::to_vec(&serde_json::json!({
                                 "action_id": action_id.clone(),
@@ -9218,6 +9542,19 @@ async fn drive_controller_forwarder(
                                             && matches!(err, TransportError::ChannelClosed | TransportError::Timeout) =>
                                     {
                                         let inflight = pending.len();
+                                        let diag = transport_diagnostics(transport.id());
+                                        let fallback_snapshot = serde_json::json!({
+                                            "inflightByTransport": { transport_label: inflight },
+                                            "lastAckTransport": last_ack_transport.clone(),
+                                            "lastAckAgeMs": last_ack_at.as_ref().map(|ts| ts.elapsed().as_millis()),
+                                            "lastSendAgeMs": last_send_at.as_ref().map(|ts| ts.elapsed().as_millis()),
+                                            "bufferedAmount": diag.as_ref().and_then(|d| d.last_buffered_amount),
+                                            "bufferedHighWater": diag.as_ref().map(|d| d.buffered_high_water),
+                                            "channel": diag.as_ref().and_then(|d| d.channel_label.clone()),
+                                            "pcState": diag.as_ref().and_then(|d| d.last_pc_state.clone()),
+                                            "iceState": diag.as_ref().and_then(|d| d.last_ice_state.clone()),
+                                            "transportId": transport.id().0,
+                                        });
                                         let drained = std::mem::take(&mut pending);
                                         let reason = format!("fast-path send failed: {err}");
                                         fail_pending_actions(state, session_id, drained, true, &reason).await;
@@ -9227,42 +9564,22 @@ async fn drive_controller_forwarder(
                                             private_beach_id = %private_beach_id,
                                             inflight,
                                             error = %err,
-                                            "fast-path send failed; falling back to primary transport"
+                                            fallback_snapshot = ?fallback_snapshot,
+                                            "unified send failed; terminating controller forwarder"
                                         );
                                         state
                                             .emit_host_devtools_event(
                                                 session_id,
-                                                "host.transport:fallback",
-                                                DevtoolsEventLevel::Warn,
+                                                "host.transport:error",
+                                                DevtoolsEventLevel::Error,
                                                 Some(serde_json::json!({
-                                                    "reason": format!("fast_path_send_error:{err}"),
+                                                    "reason": format!("unified_send_error:{err}"),
                                                     "inflight": inflight,
+                                                    "snapshot": fallback_snapshot,
                                                 })),
                                             )
                                             .await;
-                                        via_fast_path = false;
-                                        transport_label = "http_fallback";
-                                        transport = primary_transport.clone();
-                                        drop(reader_guard);
-                                        reader_guard =
-                                            ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                                        state
-                                            .update_pairing_transport_status(
-                                                session_id,
-                                                PairingTransportStatus::http_fallback(
-                                                    now_ms(),
-                                                    Some(format!("send_error:{err}")),
-                                                ),
-                                            )
-                                            .await;
-                                        info!(
-                                            target = "controller.forwarder",
-                                            session_id = %session_id,
-                                            private_beach_id = %private_beach_id,
-                                            transport = transport_label,
-                                            "controller forwarder switched transport"
-                                        );
-                                        continue;
+                                        return Err(ControllerForwarderError::Transport(reason));
                                     }
                                     Err(err) => {
                                         let drained = std::mem::take(&mut pending);
@@ -9283,6 +9600,7 @@ async fn drive_controller_forwarder(
                                     }
                                 }
                             };
+                            last_send_at = Some(sent_at);
                             debug!(
                                 target = "controller.delivery",
                                 session_id = %session_id,
@@ -9299,6 +9617,22 @@ async fn drive_controller_forwarder(
                                     action,
                                     sent_at,
                                 },
+                            );
+                            let inflight_after = pending.len();
+                            let diag = transport_diagnostics(transport.id());
+                            info!(
+                                target = "controller.delivery",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                action_id = %action_id,
+                                seq = next_seq,
+                                transport = transport_label,
+                                transport_id = %transport.id().0,
+                                inflight_before,
+                                inflight_after,
+                                buffered_amount = diag.as_ref().and_then(|d| d.last_buffered_amount),
+                                buffered_high_water = diag.as_ref().map(|d| d.buffered_high_water),
+                                "controller action sent"
                             );
                             state
                                 .emit_connector_events_for_child(
@@ -9585,6 +9919,10 @@ pub struct JoinSessionResponsePayload {
     pub transports: Vec<AdvertisedTransport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_servers: Option<Vec<TurnIceServer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice_servers_expires_at_ms: Option<i64>,
 }
 
 fn slugify(name: &str) -> String {
@@ -9623,7 +9961,14 @@ pub(crate) mod test_support {
     };
 
     type ViewerOverride = Arc<
-        dyn Fn(AppState, String, String, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        dyn Fn(
+                AppState,
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>>
             + Send
             + Sync,
     >;
@@ -9633,19 +9978,20 @@ pub(crate) mod test_support {
 
     pub fn set_viewer_worker_override<F, Fut>(f: Option<F>)
     where
-        F: Fn(AppState, String, String, String, String) -> Fut + Send + Sync + 'static,
+        F: Fn(AppState, String, String, String, String, String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let mut guard = VIEWER_WORKER_OVERRIDE.write().unwrap();
         *guard = f.map(|func| {
             Arc::new(
-                move |state, session_id, private_beach_id, passcode, base_url| {
+                move |state, session_id, private_beach_id, passcode, base_url, viewer_peer_id| {
                     Box::pin(func(
                         state,
                         session_id,
                         private_beach_id,
                         passcode,
                         base_url,
+                        viewer_peer_id,
                     )) as Pin<Box<dyn Future<Output = ()> + Send>>
                 },
             ) as ViewerOverride
@@ -9710,11 +10056,7 @@ pub(crate) mod test_support {
     }
 
     pub fn rtc_ready_override(session_id: &str) -> Option<bool> {
-        RTC_READY_OVERRIDES
-            .read()
-            .unwrap()
-            .get(session_id)
-            .copied()
+        RTC_READY_OVERRIDES.read().unwrap().get(session_id).copied()
     }
 
     pub fn clear_rtc_ready_override() {
@@ -9739,9 +10081,11 @@ mod tests {
         Arc,
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{advance, sleep, timeout, Duration};
+    use tokio::sync::Notify;
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
+    #[serial_test::serial]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
         // clear any prior captured redis writes
         let _ = test_support::take_redis_state_writes();
@@ -9755,7 +10099,8 @@ mod tests {
                   session_id: String,
                   private_beach_id: String,
                   passcode: String,
-                  _base_url: String| {
+                  _base_url: String,
+                  _viewer_peer_id: String| {
                 let invocation_count = invocation_count.clone();
                 async move {
                     assert_eq!(session_id, "sess-view");
@@ -9786,6 +10131,10 @@ mod tests {
         };
         state.register_session(register).await.unwrap();
 
+        let mut receiver = state.subscribe_session("sess-view").await;
+
+        state.spawn_viewer_worker("sess-view").await.unwrap();
+
         timeout(Duration::from_secs(2), {
             let invocation_count = invocation_count.clone();
             async move {
@@ -9795,22 +10144,7 @@ mod tests {
             }
         })
         .await
-        .expect("initial viewer worker invocation");
-
-        let mut receiver = state.subscribe_session("sess-view").await;
-
-        state.spawn_viewer_worker("sess-view").await.unwrap();
-
-        timeout(Duration::from_secs(2), {
-            let invocation_count = invocation_count.clone();
-            async move {
-                while invocation_count.load(Ordering::SeqCst) < 2 {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            }
-        })
-        .await
-        .expect("second viewer worker invocation");
+        .expect("viewer worker invocation");
 
         let event = timeout(Duration::from_secs(2), receiver.recv())
             .await
@@ -9838,6 +10172,82 @@ mod tests {
             !matching.is_empty(),
             "expected redis capture for viewer diff"
         );
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    #[serial_test::serial]
+    async fn spawn_viewer_worker_is_idempotent_while_running() {
+        test_support::clear_viewer_worker_override();
+        let _guard = OverrideGuard;
+
+        let invocation_count = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        test_support::set_viewer_worker_override(Some({
+            let invocation_count = invocation_count.clone();
+            let notify = notify.clone();
+            move |state: AppState,
+                  session_id: String,
+                  private_beach_id: String,
+                  passcode: String,
+                  _base_url: String,
+                  _viewer_peer_id: String| {
+                let notify = notify.clone();
+                let invocation_count = invocation_count.clone();
+                async move {
+                    assert_eq!(session_id, "sess-idempotent");
+                    assert_eq!(private_beach_id, "pb-idempotent");
+                    assert_eq!(passcode, "secret");
+                    invocation_count.fetch_add(1, Ordering::SeqCst);
+                    // Hold the worker open until the test releases it.
+                    notify.notified().await;
+                    // Touch state once to mirror normal behavior.
+                    let diff = beach_buggy::StateDiff {
+                        sequence: 1,
+                        emitted_at: SystemTime::now(),
+                        payload: json!({ "ping": "pong" }),
+                    };
+                    state.record_state(&session_id, diff, false).await.unwrap();
+                }
+            }
+        }));
+
+        let state = AppState::new();
+        let register = RegisterSessionRequest {
+            session_id: "sess-idempotent".into(),
+            private_beach_id: "pb-idempotent".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("secret".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        state.register_session(register).await.unwrap();
+
+        state.spawn_viewer_worker("sess-idempotent").await.unwrap();
+        timeout(Duration::from_secs(2), {
+            let invocation_count = invocation_count.clone();
+            async move {
+                while invocation_count.load(Ordering::SeqCst) < 1 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("first viewer worker invocation");
+
+        // Second spawn while the first worker is still running should be a no-op.
+        state.spawn_viewer_worker("sess-idempotent").await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            invocation_count.load(Ordering::SeqCst),
+            1,
+            "viewer worker should not respawn while active"
+        );
+
+        // Let the worker finish cleanly.
+        notify.notify_waiters();
     }
 
     #[tokio::test]

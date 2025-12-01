@@ -21,6 +21,10 @@
 3) Open `http://localhost:3001/beaches`.
 4) Click New Beach, fill Name, optionally generate ID, set Manager URL (e.g., `http://localhost:8080`) and a dev token (e.g., `test-token`).
 5) Open the beach. Use the left Sessions panel to add sessions to the canvas. Use the layout selector and tile controls. Open the right drawer to view live SSE events.
+6) Use a single session-server base: set `BEACH_SESSION_SERVER_BASE`
+   (`http://api.beach.dev:4132` in dev) and add `127.0.0.1 api.beach.dev` to
+   `/etc/hosts` so containers and the browser resolve the same host. Other
+   session/road URLs derive from the base; avoid container-only hostnames.
 
 Notes:
 - The tile surface currently shows a live placeholder; WebRTC/WS stream rendering hooks are stubbed for later fast‑path work.

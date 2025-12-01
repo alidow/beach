@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Set
+from typing import Any, Dict, Optional, Tuple, Set
 
 
 FRAME_DELAY_SECONDS = 1.0 / 30.0
@@ -99,6 +99,13 @@ class PongView:
         self._next_frame_dump_time = 0.0
         self.ball_trace_path = os.environ.get("PONG_BALL_TRACE_PATH")
         self.command_trace_path = os.environ.get("PONG_COMMAND_TRACE_PATH")
+        state_interval_env = os.environ.get("PONG_STATE_TRACE_INTERVAL")
+        try:
+            self.state_trace_interval = float(state_interval_env) if state_interval_env else 1.0
+        except ValueError:
+            self.state_trace_interval = 1.0
+        self.state_trace_path = os.environ.get("PONG_STATE_TRACE_PATH")
+        self._next_state_trace_time = 0.0
         if self.verbose_diag and self.command_trace_path:
             self._trace_diag(
                 "init",
@@ -107,6 +114,8 @@ class PongView:
                     "frame_dump_path": self.frame_dump_path,
                     "ball_trace_path": self.ball_trace_path,
                     "command_trace_path": self.command_trace_path,
+                    "state_trace_path": self.state_trace_path,
+                    "state_trace_interval": self.state_trace_interval,
                 },
             )
 
@@ -656,6 +665,37 @@ class PongView:
         except OSError:
             pass
 
+    def _trace_state_if_needed(self) -> None:
+        if not self.state_trace_path or self.state_trace_interval <= 0:
+            return
+        now = time.monotonic()
+        if now < self._next_state_trace_time:
+            return
+        self._next_state_trace_time = now + self.state_trace_interval
+
+        record = {
+            "time": time.time(),
+            "mode": self.mode,
+            "paddle": {"x": self.paddle.x, "y": self.paddle.y},
+            "ball": None,
+        }
+        if self.ball:
+            record["ball"] = {
+                "x": self.ball.x,
+                "y": self.ball.y,
+                "vx": self.ball.vx,
+                "vy": self.ball.vy,
+            }
+        trace_dir = os.path.dirname(self.state_trace_path)
+        try:
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(self.state_trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(record))
+                fp.write("\n")
+        except OSError:
+            pass
+
     def _trace_diag(self, kind: str, payload: Dict[str, Any]) -> None:
         if not self.command_trace_path:
             return
@@ -731,6 +771,7 @@ class PongView:
 
             self._read_input()
             self._update_ball(dt)
+            self._trace_state_if_needed()
             self._draw()
 
             if frame_delay > 0:

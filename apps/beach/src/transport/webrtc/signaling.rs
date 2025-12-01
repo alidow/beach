@@ -201,9 +201,22 @@ impl SignalingClient {
         metadata: Option<HashMap<String, String>>,
     ) -> Result<Arc<Self>, TransportError> {
         let websocket_url = derive_websocket_url(signaling_url)?;
-        let (ws_stream, _) = connect_async(websocket_url.as_str())
-            .await
-            .map_err(|err| TransportError::Setup(format!("websocket connect failed: {err}")))?;
+        tracing::info!(
+            target = "webrtc",
+            url = %websocket_url,
+            peer_role = ?role,
+            "connecting signaling websocket"
+        );
+        let (ws_stream, _) = connect_async(websocket_url.as_str()).await.map_err(|err| {
+            tracing::warn!(
+                target = "webrtc",
+                url = %websocket_url,
+                peer_role = ?role,
+                error = %err,
+                "signaling websocket connect failed (check beach-road reachability)"
+            );
+            TransportError::Setup(format!("websocket connect failed: {err}"))
+        })?;
         tracing::debug!(
             target = "webrtc",
             url = %websocket_url,
@@ -565,6 +578,23 @@ impl SignalingClient {
         peer_id: &str,
         signal: WebRTCSignal,
     ) -> Result<(), TransportError> {
+        let signal_kind = match &signal {
+            WebRTCSignal::Offer { .. } => "offer",
+            WebRTCSignal::Answer { .. } => "answer",
+            WebRTCSignal::IceCandidate { sealed, .. } => {
+                if sealed.is_some() {
+                    "ice_candidate_sealed"
+                } else {
+                    "ice_candidate"
+                }
+            }
+        };
+        tracing::debug!(
+            target = "webrtc",
+            peer_id,
+            signal_kind,
+            "signaling sending signal to peer"
+        );
         let payload = signal
             .into_transport_signal()
             .to_value()
@@ -806,6 +836,13 @@ async fn handle_server_message(
                 let _ = tx.send(());
             }
         }
+        ServerMessage::JoinError { reason } => {
+            tracing::warn!(
+                target = "webrtc",
+                error = reason,
+                "signaling join_error received"
+            );
+        }
         ServerMessage::PeerJoined { peer } => {
             client.register_client_peer(peer).await;
         }
@@ -819,6 +856,17 @@ async fn handle_server_message(
                 client.set_remote_peer(from_peer.clone()).await;
             }
             if let Ok(TransportSignal::WebRTC { signal }) = TransportSignal::from_value(&signal) {
+                let signal_kind = match &signal {
+                    WebRTCSignal::Offer { .. } => "offer",
+                    WebRTCSignal::Answer { .. } => "answer",
+                    WebRTCSignal::IceCandidate { .. } => "ice_candidate",
+                };
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %from_peer,
+                    signal_kind,
+                    "signaling signal received"
+                );
                 let routed = client
                     .forward_signal_to_client(&from_peer, signal.clone())
                     .await;

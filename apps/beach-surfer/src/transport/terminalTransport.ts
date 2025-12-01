@@ -104,6 +104,12 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
       });
     }
 
+    if (this.channel.isOpen()) {
+      // If the channel is already open, we rely on the consumer checking
+      // transport.isOpen() after attaching listeners, or the 'open' event
+      // firing if they attached before it opened.
+    }
+
     // If the first terminal frame was already seen by the viewer's sniffer,
     // replay it so we don't miss the Hello and get stuck on the approval UI.
     if (options.replayBinaryFirst && options.replayBinaryFirst.length > 0) {
@@ -130,6 +136,10 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
     }
 
     this.announceReadiness();
+  }
+
+  isOpen(): boolean {
+    return this.channel.isOpen();
   }
 
   send(frame: ClientFrame): void {
@@ -207,6 +217,7 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
 }
 
 export interface TerminalTransport {
+  isOpen(): boolean;
   addEventListener<K extends keyof TerminalTransportEventMap>(
     type: K,
     listener: (event: TerminalTransportEventMap[K]) => void,

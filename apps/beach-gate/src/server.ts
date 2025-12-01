@@ -188,7 +188,8 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
     }
 
     const token = request.accessToken!;
-    if (!hasRequiredEntitlement(token.entitlements, config.turn.requiredEntitlements)) {
+    // In dev mode (mockClerk), allow all authenticated users to access TURN
+    if (!config.mockClerk && !hasRequiredEntitlement(token.entitlements, config.turn.requiredEntitlements)) {
       request.log.warn({ userId: token.sub }, 'turn.credentials_forbidden');
       return reply.status(403).send({ error: 'forbidden', detail: 'TURN access not granted.' });
     }

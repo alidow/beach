@@ -20,7 +20,18 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     pub fn new(server_base_url: impl AsRef<str>) -> Result<Self, SessionError> {
-        let mut base = server_base_url.as_ref().trim().to_string();
+        // Allow a centralized override so callers and env stay consistent.
+        let mut base = std::env::var("BEACH_SESSION_SERVER_BASE")
+            .ok()
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .unwrap_or_else(|| server_base_url.as_ref().trim().to_string());
         if base.is_empty() {
             return Err(SessionError::InvalidConfig(
                 "session server base url cannot be empty".into(),

@@ -8,6 +8,7 @@ use crate::protocol::{
     ClientFrame, ExtensionFrame, HostFrame, encode_client_frame_binary, encode_host_frame_binary,
 };
 
+pub mod bus;
 pub mod extensions;
 pub mod framed;
 pub mod ipc;

@@ -21,6 +21,11 @@ Manager’s WebRTC fast‑path working inside the Docker stack.
   `BEACH_ICE_PUBLIC_IP`/`BEACH_ICE_PUBLIC_HOST`. Running `direnv allow` once is
   mandatory; every `docker compose` command should be wrapped with
   `direnv exec .` so the hints reach the container.
+* Use a single session-server base (`BEACH_SESSION_SERVER_BASE`,
+  default `http://api.beach.dev:4132`) and add `127.0.0.1 api.beach.dev` to
+  `/etc/hosts`. Compose maps the hostname to the host gateway; derived vars
+  (`BEACH_SESSION_SERVER`, `BEACH_ROAD_URL`, `BEACH_PUBLIC_SESSION_SERVER`)
+  keep all services on the same URL.
 * `scripts/docker/beach-manager-entry.sh` resolves `BEACH_ICE_PUBLIC_HOST`
   inside the container and exports `BEACH_ICE_PUBLIC_IP` if the host provided
   only a DNS name.

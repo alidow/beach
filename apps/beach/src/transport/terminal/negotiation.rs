@@ -77,9 +77,33 @@ pub async fn negotiate_transport(
             let offer_json =
                 serde_json::to_string(&offer).unwrap_or_else(|_| "<invalid offer>".into());
             trace!(target = "session::webrtc", preferred = ?preferred_role, offer = %offer_json);
-            let Some(signaling_url) = offer.get("signaling_url").and_then(Value::as_str) else {
+            let Some(signaling_url_str) = offer.get("signaling_url").and_then(Value::as_str) else {
                 errors.push("webrtc offer missing signaling_url".to_string());
                 continue;
+            };
+
+            // Rewrite signaling URL to match the internal Docker URL if configured.
+            // This ensures that if we are running in the container (Host), we use the internal URL (e.g. http://beach-road:4132)
+            // instead of the public URL (e.g. http://127.0.0.1:4132) which is unreachable from inside the container.
+            // We use the BEACH_ROAD_URL environment variable which is injected by pong-stack.sh.
+            let signaling_url = if let Ok(mut url) = Url::parse(signaling_url_str) {
+                let rewritten = if let Ok(internal_url_str) = env::var("BEACH_ROAD_URL") {
+                    if let Ok(internal_url) = Url::parse(internal_url_str.trim()) {
+                        let _ = url.set_scheme(internal_url.scheme());
+                        if let Some(internal_host) = internal_url.host_str() {
+                            let _ = url.set_host(Some(internal_host));
+                        }
+                        let _ = url.set_port(internal_url.port());
+                        Some(url.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                rewritten.unwrap_or_else(|| signaling_url_str.to_string())
+            } else {
+                signaling_url_str.to_string()
             };
             let meta_role = match offer.get("role").and_then(Value::as_str) {
                 Some("offerer") => WebRtcRole::Offerer,
@@ -123,7 +147,7 @@ pub async fn negotiate_transport(
             debug!(transport = "webrtc", signaling_url = %signaling_url, role = ?effective_role, "attempting webrtc transport");
             match effective_role {
                 WebRtcRole::Offerer => match OffererSupervisor::connect(
-                    signaling_url,
+                    &signaling_url,
                     Duration::from_millis(poll_ms),
                     passphrase,
                     request_mcp_channel,
@@ -160,7 +184,7 @@ pub async fn negotiate_transport(
                     }
                 },
                 WebRtcRole::Answerer => match transport_mod::webrtc::connect_via_signaling(
-                    signaling_url,
+                    &signaling_url,
                     effective_role,
                     Duration::from_millis(poll_ms),
                     passphrase,
@@ -201,8 +225,40 @@ pub async fn negotiate_transport(
 
     for offer in &offers {
         if let TransportOffer::WebSocket { url } = offer {
+            let url = if let Ok(mut parsed) = Url::parse(url) {
+                let rewritten = if let Ok(internal_url_str) = env::var("BEACH_ROAD_URL") {
+                    if let Ok(internal_url) = Url::parse(internal_url_str.trim()) {
+                        if let Some(internal_host) = internal_url.host_str() {
+                            let _ = parsed.set_host(Some(internal_host));
+                        }
+                        let _ = parsed.set_port(internal_url.port());
+
+                        // Fix scheme for WebSocket
+                        match internal_url.scheme() {
+                            "http" => {
+                                let _ = parsed.set_scheme("ws");
+                            }
+                            "https" => {
+                                let _ = parsed.set_scheme("wss");
+                            }
+                            s => {
+                                let _ = parsed.set_scheme(s);
+                            }
+                        }
+
+                        Some(parsed.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                rewritten.unwrap_or_else(|| url.clone())
+            } else {
+                url.clone()
+            };
             debug!(transport = "websocket", url = %url, "attempting websocket transport");
-            match transport_mod::websocket::connect(url).await {
+            match transport_mod::websocket::connect(&url).await {
                 Ok(transport) => {
                     let transport = Arc::from(transport);
                     info!(transport = "websocket", url = %url, "transport established");

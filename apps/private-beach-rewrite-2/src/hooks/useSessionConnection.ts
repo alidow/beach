@@ -349,6 +349,16 @@ export function useSessionConnection({
 
     return () => {
       if (disconnect) {
+        // Log intentional teardown so we can distinguish browser-initiated closes from ICE drops.
+        logConnectionEvent(
+          'fast-path:disconnect-request',
+          {
+            tileId,
+            sessionId,
+            privateBeachId: privateBeachId ?? null,
+            managerUrl: managerUrl ?? null,
+          },
+        );
         disconnect();
       }
     };

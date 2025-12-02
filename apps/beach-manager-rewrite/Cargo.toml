@@ -1,0 +1,29 @@
+[package]
+name = "beach-manager-rewrite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+manager-sdk = { path = "../../crates/manager-sdk" }
+prometheus = "0.13"
+once_cell = "1"
+async-trait = "0.1"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+transport-bus = { path = "../../crates/transport-bus" }
+transport-unified-adapter = { path = "../../crates/transport-unified-adapter" }
+transport-webrtc = { path = "../../crates/transport-webrtc" }
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "migrate"] }
+chrono = { version = "0.4", features = ["clock"] }
+sea-query = { version = "0.30", default-features = false, features = ["backend-postgres", "with-chrono", "derive"] }
+sea-query-binder = { version = "0.5", default-features = false, features = ["sqlx-postgres", "with-chrono"] }
+sea-orm = { version = "0.12", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-chrono"] }
+futures = "0.3"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }

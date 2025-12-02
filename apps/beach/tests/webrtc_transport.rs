@@ -631,6 +631,7 @@ struct AttachRequest {
     #[serde(default)]
     peer_id: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     passphrase: Option<String>,
 }
 

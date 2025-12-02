@@ -1,147 +1,95 @@
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::RwLock;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tracing::debug;
-
-use transport_bus::{Bus, BusError, BusMessage, BusResult};
+use transport_bus::BusError;
+use transport_unified_adapter::{ExtensionTransport, UnifiedBus};
 
 use crate::protocol::ExtensionFrame;
 use crate::transport::{ExtensionDirection, ExtensionLane, Transport, extensions};
 
 const DEFAULT_NAMESPACE: &str = "manager";
 
-/// A pub/sub bus backed by the unified transport extension channel.
-pub struct UnifiedBus {
+/// Bridge the existing transport into the shared unified bus adapter.
+struct TransportBridge {
     transport: Arc<dyn Transport>,
-    namespace: String,
-    outbound_direction: ExtensionDirection,
-    topics: Arc<RwLock<HashMap<String, broadcast::Sender<BusMessage>>>>,
-    pump: OnceLock<JoinHandle<()>>,
+    direction: ExtensionDirection,
 }
 
-impl UnifiedBus {
-    pub fn new(
-        transport: Arc<dyn Transport>,
-        outbound_direction: ExtensionDirection,
-        namespace: impl Into<String>,
-    ) -> Self {
+impl TransportBridge {
+    fn new(transport: Arc<dyn Transport>, direction: ExtensionDirection) -> Self {
         Self {
             transport,
-            namespace: namespace.into(),
-            outbound_direction,
-            topics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            pump: OnceLock::new(),
+            direction,
         }
-    }
-
-    fn sender_for(&self, topic: &str) -> broadcast::Sender<BusMessage> {
-        let mut guard = self.topics.write();
-        guard
-            .entry(topic.to_string())
-            .or_insert_with(|| broadcast::channel(128).0)
-            .clone()
-    }
-
-    fn ensure_pump(&self) {
-        if self.pump.get().is_some() {
-            return;
-        }
-        let mut rx = self.transport.subscribe_extensions(&self.namespace);
-        let topics: Arc<RwLock<HashMap<String, broadcast::Sender<BusMessage>>>> =
-            Arc::clone(&self.topics);
-        let handle = tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        let topic = frame.kind.clone();
-                        let payload = frame.payload.clone();
-                        let sender = {
-                            let mut guard = topics.write();
-                            guard
-                                .entry(topic.clone())
-                                .or_insert_with(|| broadcast::channel(128).0)
-                                .clone()
-                        };
-                        let _ = sender.send(BusMessage { topic, payload });
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        debug!(
-                            target = "transport.bus",
-                            skipped, "bus receiver lagged on namespace"
-                        );
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        let _ = self.pump.set(handle);
     }
 }
 
-impl Bus for UnifiedBus {
-    fn subscribe(&self, topic: &str) -> broadcast::Receiver<BusMessage> {
-        self.ensure_pump();
-        self.sender_for(topic).subscribe()
+#[async_trait::async_trait]
+impl ExtensionTransport for TransportBridge {
+    fn subscribe_extensions(
+        &self,
+        namespace: &str,
+    ) -> tokio::sync::broadcast::Receiver<transport_unified_adapter::ExtensionFrame> {
+        let mut rx = self.transport.subscribe_extensions(namespace);
+        let (tx, rx_bridge) = tokio::sync::broadcast::channel(128);
+        tokio::spawn(async move {
+            while let Ok(frame) = rx.recv().await {
+                let _ = tx.send(transport_unified_adapter::ExtensionFrame {
+                    namespace: frame.namespace.clone(),
+                    topic: frame.kind.clone(),
+                    payload: frame.payload.clone(),
+                });
+            }
+        });
+        rx_bridge
     }
 
-    fn publish(&self, topic: &str, payload: Bytes) -> BusResult<()> {
+    fn send_extension(&self, namespace: &str, topic: &str, payload: Bytes) -> Result<(), BusError> {
         let frame = ExtensionFrame {
-            namespace: self.namespace.clone(),
+            namespace: namespace.to_string(),
             kind: topic.to_string(),
-            payload,
+            payload: payload.clone(),
         };
         self.transport
-            .send_extension(
-                self.outbound_direction,
-                frame.clone(),
-                ExtensionLane::ControlOrdered,
-            )
-            .map_err(|err| BusError::Transport(err.to_string()))?;
-        // publish locally for any in-process subscribers
+            .send_extension(self.direction, frame.clone(), ExtensionLane::ControlOrdered)
+            .map_err(|e| BusError::Transport(e.to_string()))?;
+        // Publish locally for in-process subscribers.
         extensions::publish(self.transport.id(), frame);
         Ok(())
     }
-}
 
-#[cfg(test)]
-impl UnifiedBus {
-    pub fn inject_frame(&self, frame: ExtensionFrame) {
-        self.ensure_pump();
-        let topic = frame.kind.clone();
-        let sender = self.sender_for(&topic);
-        let _ = sender.send(BusMessage {
-            topic,
-            payload: frame.payload.clone(),
-        });
+    fn id(&self) -> String {
+        format!("{:?}", self.transport.id())
     }
 }
 
 /// Helper to create a default manager bus from a transport.
 pub fn manager_bus_from_host(transport: Arc<dyn Transport>) -> UnifiedBus {
-    UnifiedBus::new(
+    let bridge = Arc::new(TransportBridge::new(
         transport,
         ExtensionDirection::HostToClient,
-        DEFAULT_NAMESPACE.to_string(),
-    )
+    ));
+    UnifiedBus::new(bridge, DEFAULT_NAMESPACE)
 }
 
 pub fn manager_bus_from_client(transport: Arc<dyn Transport>) -> UnifiedBus {
-    UnifiedBus::new(
+    let bridge = Arc::new(TransportBridge::new(
         transport,
         ExtensionDirection::ClientToHost,
-        DEFAULT_NAMESPACE.to_string(),
-    )
+    ));
+    UnifiedBus::new(bridge, DEFAULT_NAMESPACE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::ipc;
+    use beach_buggy::{
+        ActionCommand, ControllerBusPublisher, ControllerBusSubscriber, TOPIC_CONTROLLER_ACK,
+        TOPIC_CONTROLLER_INPUT,
+    };
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn unified_bus_round_trip_ipc() {
@@ -166,6 +114,72 @@ mod tests {
             let msg = rx.recv().await.expect("receive ok");
             assert_eq!(msg.topic, "controller/input");
             assert_eq!(msg.payload, Bytes::from_static(b"ping"));
+        });
+    }
+
+    #[test]
+    fn controller_input_ack_round_trip_ipc() {
+        let pair = ipc::build_pair().expect("ipc pair");
+        let host_bus = Arc::new(manager_bus_from_host(Arc::from(pair.server)));
+        let client_bus = Arc::new(manager_bus_from_client(Arc::from(pair.client)));
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let host_publisher = ControllerBusPublisher::new(host_bus.clone());
+            let mut host_ack_rx = host_bus.subscribe(TOPIC_CONTROLLER_ACK);
+            ControllerBusSubscriber::new(host_bus.clone()).spawn_terminal_worker(
+                {
+                    let writes = writes.clone();
+                    move |bytes: &[u8]| {
+                        writes
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(bytes).to_string());
+                        Ok(())
+                    }
+                },
+                host_publisher.clone(),
+            );
+
+            let mut client_ack_rx = client_bus.subscribe(TOPIC_CONTROLLER_ACK);
+            let action = ActionCommand {
+                id: "bus-1".into(),
+                action_type: "terminal_write".into(),
+                payload: serde_json::json!({"bytes": "hi over bus"}),
+                expires_at: None,
+            };
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "type": "action",
+                "payload": action,
+            }))
+            .expect("serialize action");
+            host_bus.inject_frame(ExtensionFrame {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+                kind: TOPIC_CONTROLLER_INPUT.to_string(),
+                payload: Bytes::from(payload),
+            });
+
+            let ack_msg = tokio::time::timeout(Duration::from_secs(2), host_ack_rx.recv())
+                .await
+                .expect("host ack timeout")
+                .expect("host ack");
+            client_bus.inject_frame(ExtensionFrame {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+                kind: TOPIC_CONTROLLER_ACK.to_string(),
+                payload: ack_msg.payload.clone(),
+            });
+            let ack_msg = tokio::time::timeout(Duration::from_secs(2), client_ack_rx.recv())
+                .await
+                .expect("client ack timeout")
+                .expect("client ack");
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&ack_msg.payload).expect("decode ack envelope");
+            assert_eq!(envelope["type"], "ack");
+            assert_eq!(envelope["payload"]["id"], "bus-1");
+
+            let seen = writes.lock().unwrap();
+            assert_eq!(seen.as_slice(), ["hi over bus"]);
         });
     }
 }

@@ -33,24 +33,53 @@ Goal: stand up a parallel, cleanly factored manager that joins every host as a s
 - `api/`: Axum routes for health, attach status, debug traces, and (later) Surfer/agent APIs mirrored from legacy.
 - `assign/`: manager membership + rendezvous/consistent hashing to map hosts to managers; heartbeat + capacity (max 50) enforcement.
 - `bus/`: unified message-bus facade over the WebRTC extension channel; each participant exposes explicit `subscriber.rs`/`publisher.rs` (or `subscriber/mod.rs`, `publisher/mod.rs`) modules so it’s clear what topics are consumed/produced.
+- `persistence/`: ORM-backed data access (SeaORM + SeaQuery) to stay async and close to SQL. Avoid raw SQL where possible; keep schema definitions centralized and reusable.
 - `bus/`: unified message-bus facade over the WebRTC extension channel so beach-buggy (and future clients) subscribe/publish by namespace/topic instead of bespoke handlers; keeps backward compatibility by emitting legacy hints when needed and aliasing legacy topics.
 
 ## Milestones (bite-sized, trackable)
-- [ ] M0: Scaffold crate `apps/beach-manager-rewrite` with Axum/Tokio, config, telemetry, health endpoints; lint/tests wired.
+- [x] M0: Scaffold crate `apps/beach-manager-rewrite` with Axum/Tokio, config, telemetry, health endpoints; lint/tests wired. _Binary crate added with env-driven bind addr/logging, tracing init, and `/health`/`/readyz` routes._
 - [ ] M1: Auth layer with Gate/Clerk validation + bypass flag; per-request correlation fields.
 - [ ] M2: Beach client shim that performs attach (host_session_id → peer_session_id) and negotiates unified transport via Beach Road; logs all phases.
-- [ ] M3: Extension router: subscribe/send `manager` namespace; lane selection + metrics; unit tests for routing/unknown labels.
-- [ ] M3b: Connectivity smoke ready: bring up the dedicated smoke stack and pass the 60s WebRTC/cache sync smoke (host ↔ manager-rewrite) on alternate ports.
-- [ ] M3c: Message bus shim: wrap the unified channel in a topic-based bus (namespaces/topics) with adapter for beach-buggy and manager-as-just-a-subscriber/publisher; emit compatibility hints (`extensions.namespaces=["manager"]`) so hosts opt in uniformly.
-- [ ] M3d: Host bus adoption (partial): remove controller auto-attach gating in `apps/beach`, always stand up the bus on unified transport, and drop legacy fastpath peers.
+- [ ] M3: Extension router: subscribe/send unified bus topics; lane selection + metrics; unit tests for routing/unknown labels.
+  - [x] M3a (scaffold): Bus ingress stub in rewrite with `/debug/bus-ingest` that enqueues `beach.manager.*` topics into the queue; ready for real transport hook. _LocalBus-based ingest helper + tests added; `attach_bus` starts ingest on `beach.manager.*` topics._
+- [x] M3b: Wire the real unified transport bus into `attach_bus` once the WebRTC shim lands; remove reliance on the debug endpoint; add an integration test that publishes over the real bus and sees the queue drain/persist. _RTC adapter moved to `transport-webrtc` with `attach_and_build_transport`; rewrite honors `BEACH_MANAGER_BUS_MODE=rtc` to attach per-host and feed UnifiedBus; ignored RTC integration test publishes over the real bus and drains into queue/persistence._
+- [ ] M3b: Connectivity smoke ready: bring up the dedicated smoke stack and pass the 60s WebRTC/cache sync smoke (host ↔ manager-rewrite) on alternate ports. _Smoke scaffold added under `apps/beach-manager-rewrite/tests/smoke/` with a compose stack (Road 14132, manager 18081) and `run-smoke.sh` helper; host container included; `run-smoke.sh long` exercises 60s of RTC bus testing when `BEACH_RTC_TEST_HOST_SESSION_ID` is provided._
+- [x] M3c: Message bus shim: wrap the unified channel in a topic-based bus (namespaces/topics) with adapter for beach-buggy and manager-as-just-a-subscriber/publisher; emit compatibility hints (`extensions.namespaces=["manager"]`) so hosts opt in uniformly. _Manager-side bus publisher + ingress live; shared transport-unified-adapter crate added; RTC adapter wired via `transport-webrtc`; RTC bus test verified._
+- [ ] M3d: Host bus adoption (partial): remove controller auto-attach gating in `apps/beach`, always stand up the bus on unified transport, and drop legacy fastpath peers. _In progress: unified bus crate landed; host fastpath tests removed; cleanup continuing._
 - [ ] M3e: Buggy controller over bus: beach-buggy consumes `controller/input` and publishes `controller/ack|state|health` on the bus; host no longer handles controller logic directly.
-- [ ] M3f: Manager controller over bus: manager publishes actions and consumes acks via the bus, no HTTP/controller-specific channels.
+- [x] M3f: Manager controller over bus: manager publishes actions and consumes acks via the bus, no HTTP/controller-specific channels. _Manager bus publisher added for `beach.manager.*`; ingest pipes acks/actions/state into queue; LocalBus/IPC tests cover action→ack→persistence round-trip; RTC bus test verified against live stack._
 - [ ] M3g: Subscriber/publisher clarity: each participant (host/beach-buggy/manager) has explicit `subscriber.rs`/`publisher.rs` modules listing topics and handling, to make the bus wiring easy to audit.
+- [x] M3h: Host clean sweep (bus-only): delete fastpath/attach/manager-action-client plumbing from `apps/beach/src/server/terminal/host.rs`; host always exposes bus on unified transport and only listens/publishes on `beach.host.*`/`beach.manager.*` topics. Add targeted tests for bus wiring if feasible. _Done: fastpath tests/helpers removed; idle-snapshot/HTTP fallback deleted; bus-only wiring for input/unified actions; warnings silenced._
+- [x] M3h.1: Remove manager action client + fastpath attach structs from `host.rs`; drop HTTP manager paths and fastpath permits.
+- [x] M3h.2: Wire host to instantiate bus on unified transport and hand it to buggy; publish host/viewer traffic on `beach.host.*`, subscribe to `beach.manager.*` for control, no hints/gates.
+- [x] M3h.3: Add a small test (IPC transport) to assert host-side bus subscription delivers `beach.manager.action` to buggy and emits an ack. _Added bus-level action→ack roundtrip test in `apps/beach/src/transport/unified_bridge.rs`._
+- [x] M3h.4: Remove remaining fastpath scaffolding (ControllerTransportSwitch, ControllerAttachState, FastPathStateChannel); collapse state to bus-only and clear warnings.
+- [x] M3h.5: Trim controller channel code paths (run_controller_channel, payload handlers) to bus-only or delete if unused. _Controller path now bus-only; covered by the new bus roundtrip test._
+- [x] M3h.6: Clean imports/tests in host after removals; ensure warnings are resolved.
 - [ ] M4a: Extension→queue wiring: action/ack/state extensions flow into Redis Streams with backpressure limits; tests cover drop/queue/ack paths in-memory + Redis.
+- [x] M4a.1: In-memory queue adapter for action/ack/state with backpressure counters + unit tests. _Added `InMemoryQueue` with drop counters in `apps/beach/src/transport/queue.rs`._
+- [x] M4a.2: Redis Streams adapter (config, connection manager, consumer group setup) plus integration test gated behind `redis-queue` feature. _Implemented `RedisQueue` in `apps/beach/src/transport/queue_redis.rs` with XGROUP init and XREAD/XACK/XTRIM flow; ignored integration test requires `REDIS_URL`._
+- [x] M4a.3: Wire unified bus ingress → queue adapter; emit metrics for enqueue/drop/ack. _Added `queue_bridge` with bus subscribers for action/ack/state → queue, atomic counters, and a LocalBus test. Can plug either in-memory or Redis queues via `ControllerQueue` trait._
+- [x] M4a.4: Add small harness test to replay queued actions through buggy and assert ack/state flow. _Queue bridge test now enqueues actions from bus, drains queue, publishes ack/state back, and asserts delivery on the bus._
+  - [x] M4a.5: Queue backend builder. _Builder lives with the manager rewrite runtime; `apps/beach` stays transport-only with no Postgres/DB awareness._
 - [ ] M4b: Persistence: controller leases/events persisted to Postgres with RLS; idempotent writes and retries; Postgres-backed tests.
-- [ ] M5: Manager assignment service: Postgres/Redis-backed membership table, heartbeat, rendezvous hashing for host → manager; refuse assignment if capacity exceeded; tests for reassignment; early smoke that runs attach + action across two managers.
+  - [x] M4b.1: Add SeaORM models/migrations for controller lease, action log, manager assignment snapshot; wire Diesel/SQL bridge if needed. _SeaORM entities added in rewrite; SQLx migrations 0001/0002 create assignments + leases/actions tables._
+  - [x] M4b.2: Persistence adapter trait + in-memory stub; unit tests for idempotent upsert + fetch flows. _`PersistenceAdapter` trait + `InMemoryPersistence` added with round-trip test._
+  - [x] M4b.3: Postgres adapter implementation with retry/backoff; integration test gated behind `PG_URL`. _SeaORM adapter now runs embedded migrations and uses ORM entities; ignored PG/SeaORM round-trip gated by `PG_URL`._
+  - [x] M4b.4: Wire queue drain → persistence writes; ensure inserts are idempotent and ordered; add metrics. _Queue→persistence drain + pipeline lives in the manager rewrite runtime; `apps/beach` does not talk to Postgres._
+  - [x] M4b.5: Add small harness test that writes an action/ack/state to Postgres via the adapter and re-reads it, asserting lease scoping/RLS works in test mode. _Ignored PG harness added in persistence module (uses `PG_URL/BEACH_DATABASE_URL`) to insert/fetch lease + action via SeaORM adapter; RLS assumptions TBD when DB schema enforces it._
+  - [ ] M5: Manager assignment service: Postgres/Redis-backed membership table, heartbeat, rendezvous hashing for host → manager; refuse assignment if capacity exceeded; tests for reassignment; early smoke that runs attach + action across two managers.
+  - [x] M5.1: Define SeaORM models/migrations for `manager_instance` + `manager_assignment` (with capacity/load fields) and Redis heartbeat keys; add unit tests for hash selection. _Redis assignment store + heartbeat scaffold added; Postgres adapter runs embedded SQLx migrations (0001_init); SeaORM assignment store added (ORM path) using the same schema; assignment service filters stale instances via configurable TTL._
+    - Next step: expand ORM coverage for other persistence domains (leases/action log) and add an ignored SeaORM round-trip test in CI when PG_URL is set.
+  - [x] M5.2: Implement rendezvous hashing + capacity filter; in-memory adapter with tests for reassignment when one instance goes over capacity. _Hashing helper added in `crates/manager-sdk/src/assignment.rs` with tests (filters full nodes, deterministic choice, capacity bias)._
+  - [x] M5.3: Redis/Postgres-backed adapter with heartbeat TTL + reassignment on stale instances; integration test (ignored) with two managers simulated. _Redis/SeaORM/SQLx stores now expose TTL-aware instance listing; assignment service updates stored load and filters stale rows; ignored integration test covers stale -> fresh reassign and capacity fallback._
+  - [x] M5.4: Hook assignment resolver into manager attach flow (rewrite) behind a feature flag/env; log decisions + metrics. _Attach endpoint consults assignment service with redirect hints + counters; assignment feature flagged via `BEACH_ASSIGNMENT_ENABLED`._
+  - [ ] M5.5: Early smoke: stand up two rewrite managers in smoke stack, hash a host to one, kill it, and assert reassignment occurs.
 - [ ] M6: Surfacing APIs (REST/MCP parity subset): attach-by-code passthrough to Road, register session, controller lease acquire/release; SSE deprecated in favor of WebRTC-only; tests for auth + RLS.
 - [ ] M7: E2E smokes: docker-compose stack with rewrite manager; `pong-stack.sh` variant hitting rewrite; CI job to run webrtc tester against rewrite.
+  - [x] Add `beach-manager-rewrite` service to `docker-compose.yml` (published port 8081) guarded by `BEACH_MANAGER_IMPL=rewrite` toggle and a `PRIVATE_BEACH_MANAGER_URL` helper. _Service added with addr 8081 and env for instance/capacity/backend._
+  - [x] Update `apps/private-beach/demo/pong/tools/pong-stack.sh` to accept `PONG_MANAGER_IMPL`/`BEACH_MANAGER_IMPL` and spin up the rewrite service on alternate ports. _Script now switches to `beach-manager-rewrite` and port 8081 when impl=rewrite._
+  - [x] Wire rewrite service env (`BEACH_MANAGER_INSTANCE_ID`, `BEACH_MANAGER_CAPACITY`, `BEACH_QUEUE_BACKEND`, `REDIS_URL`, `DATABASE_URL`) into compose/env file. _Compose injects these plus `PRIVATE_BEACH_MANAGER_URL` for rewrite._
 - [ ] M8: Cleanup: flip default via env, document migration, delete unused code paths post-acceptance.
 - [ ] M9: Hot failover prep: add secondary manager attachment and cache warmback for seamless host failover; tests that drop primary and verify reconnect to secondary without losing controller context.
 - [ ] M9b: Controller-path smoke: in the smoke stack, run a controller host/agent that drives a target host (e.g., Pong player) through manager-rewrite; assert actions flow and state updates reflect control without HTTP fallback.
@@ -133,17 +162,25 @@ Goal: stand up a parallel, cleanly factored manager that joins every host as a s
 - Suitable to run at M9b once controller pipeline + unified transport are stable.
 
 ### Message bus model (compatibility + clarity)
-- Treat the unified WebRTC extension channel as a message bus: all traffic is `{namespace, topic, payload}`; beach-buggy subscribes to its topics (e.g., `manager:action`, `manager:ack`, `manager:state`, `manager:health`) and can publish too. Manager is just another subscriber/publisher on the same bus.
-- Backward compatibility: advertise `extensions.namespaces=["manager"]` only; if any legacy host still expects the old label, provide a shim to map it client-side and then delete once all hosts are updated.
-- Enforcement: namespace ACLs ensure viewers don’t receive controller topics; metrics/logs per topic for observability.
+- Treat the unified WebRTC channel as a single bus: all traffic is `{topic, payload}`. Use topic prefixes to separate concerns:
+  - Host/viewer traffic: `beach.host.*` (state/health/etc.). Host subscribes here.
+  - Manager control: `beach.manager.*` (e.g., `beach.manager.action`, `beach.manager.ack`, `beach.manager.state`, `beach.manager.health`). Beach-buggy subscribes/publishes here; manager is just another pub/sub participant.
+- Backward compatibility: advertise `extensions.namespaces=["manager"]` only; if any legacy host still expects the old label, provide a client-side shim and then delete once all hosts are updated.
+- Enforcement: topic ACLs ensure viewers don’t receive manager control topics; metrics/logs per topic for observability.
 - Intent: a simple pub/sub model so any crate (manager, buggy, agents) can attach listeners and publish without bespoke channels; unified channel stays the single transport.
-- Beach association handshake: when a host is linked to a private beach, manager publishes a bus message (manager namespace/topic) to that host’s harness with everything needed to interact (manager/beach URL, bridge token/lease info, attach code, idle snapshot hints). Host does not bake in beach knowledge; it just consumes the message and uses the provided token on subsequent calls.
+- Beach association handshake: when a host is linked to a private beach, manager publishes a bus message (manager topic) to that host’s harness with everything needed to interact (manager/beach URL, bridge token/lease info, attach code, idle snapshot hints). Host does not bake in beach knowledge; it just consumes the message and uses the provided token on subsequent calls.
 - Incremental rollout plan:
-  - Phase 1: host always stands up the bus once unified transport is ready; controller auto-attach logic removed.
-  - Phase 2: buggy handles controller input/ack/state/health solely via bus topics; host delegates.
-  - Phase 3: manager publishes actions and listens for acks on bus; legacy controller channels removed.
+  - Phase 1: host always stands up the bus once unified transport is ready; controller/fastpath/auto-attach logic removed.
+  - Phase 2: buggy handles controller input/ack/state/health solely via `beach.manager.*`; host delegates.
+  - Phase 3: manager publishes actions and listens for acks on `beach.manager.*`; legacy controller channels removed.
   - Phase 4: controller-path smoke (M9b) runs entirely on bus; remove legacy shims.
 - Conventions: bus-facing modules live in `bus/subscriber.rs` and `bus/publisher.rs` (or `subscriber/mod.rs`, `publisher/mod.rs`) per participant so topic handlers are easy to find.
+- Connectivity hygiene (inside/outside Docker):
+  - Use a single base (`BEACH_SESSION_SERVER_BASE`) that is reachable by all peers. For pure localhost dev, `/etc/hosts` `api.beach.dev -> 127.0.0.1` is fine; for LAN/remote hosts, set it to a LAN/public IP or DNS and avoid loopback.
+  - ICE: set `BEACH_ICE_PUBLIC_IP/HOST` to the host’s LAN/public IP, not a container IP; ensure Pion uses NAT 1:1 mapping so candidates are reachable from outside Docker.
+  - TURN/STUN must be reachable from both in-Docker and external hosts on the same IP/ports; expose 3478/udp+tcp on the host, not just the bridge.
+  - Signaling/URLs returned by Road/manager must avoid container-only hostnames; use host/LAN/public names so browsers and hosts outside Docker can connect.
+  - Smoke: one peer in Docker, one on host/LAN; assert srflx/relay candidates appear and DC opens without HTTP fallback.
 
 ## Next Steps to Start
 1) Create crate skeleton (`cargo new apps/beach-manager-rewrite --bin`), add to workspace.  

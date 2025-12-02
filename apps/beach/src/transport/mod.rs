@@ -12,11 +12,16 @@ pub mod bus;
 pub mod extensions;
 pub mod framed;
 pub mod ipc;
+pub mod queue;
+pub mod queue_bridge;
 pub mod ssh;
 pub mod terminal;
 pub mod unified_bridge;
 pub mod webrtc;
 pub mod websocket;
+
+#[cfg(feature = "redis-queue")]
+pub mod queue_redis;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransportId(pub u64);

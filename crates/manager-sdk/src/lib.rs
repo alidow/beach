@@ -9,6 +9,9 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod assignment;
+pub mod assignment_store;
+
 #[derive(Clone)]
 pub struct ManagerClient {
     http: Client,

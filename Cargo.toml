@@ -6,11 +6,14 @@ members = [
   "apps/beach-lifeguard/server",
   "apps/beach-lifeguard/client",
   "apps/beach-manager",
+  "apps/beach-manager-rewrite",
   "crates/beach-buggy",
   "crates/harness-proto",
   "crates/manager-sdk",
   "crates/test-timeout",
   "crates/transport-bus",
+  "crates/transport-webrtc",
+  "crates/transport-unified-adapter",
 ]
 exclude = [
   "apps/beach-cabana",

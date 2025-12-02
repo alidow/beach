@@ -899,6 +899,7 @@ async fn create_channel(
     Ok(dc)
 }
 
+#[allow(dead_code)]
 fn parse_action_message(msg: &DataChannelMessage) -> HarnessResult<ActionCommand> {
     if !msg.is_string {
         return Err(HarnessError::Transport(

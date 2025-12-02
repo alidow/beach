@@ -174,6 +174,7 @@ impl PtyWriter {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn for_test(writer: Box<dyn std::io::Write + Send>) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),

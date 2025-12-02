@@ -517,6 +517,7 @@ pub(crate) struct SharedTransport {
 }
 
 impl SharedTransport {
+    #[allow(dead_code)]
     pub(crate) fn new(
         initial: Arc<dyn Transport>,
         metadata: Option<HashMap<String, String>>,
@@ -629,6 +630,7 @@ pub(crate) struct TransportSupervisor {
 }
 
 impl TransportSupervisor {
+    #[allow(dead_code)]
     pub(crate) fn new(
         shared: Arc<SharedTransport>,
         session_handle: SessionHandle,
@@ -722,11 +724,13 @@ impl TransportSupervisor {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct HeartbeatPublisher {
     transport: Arc<dyn Transport>,
     supervisor: Option<Arc<TransportSupervisor>>,
 }
 
+#[allow(dead_code)]
 impl HeartbeatPublisher {
     pub(crate) fn new(
         transport: Arc<dyn Transport>,
@@ -783,6 +787,7 @@ impl HeartbeatPublisher {
     }
 }
 
+#[allow(dead_code)]
 fn send_heartbeat_frame(
     transport: &Arc<dyn Transport>,
     seq: u64,

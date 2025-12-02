@@ -37,6 +37,13 @@ Goal: make the unified WebRTC channel a simple pub/sub message bus. `apps/beach`
 - Stay unified-only; no HTTP fallback for controller paths.
 - Preserve existing logging targets where helpful, but the “auto-attach hint” and “controller attach” gates should go away.
 
+## Progress 2025-02-12
+- Transport bus lives in `crates/transport-bus` with a unified WebRTC adapter (`apps/beach/src/transport/bus.rs`) that routes topics over the single datachannel; tests cover IPC roundtrip plus controller input/ack on the bus.
+- `beach-buggy` now owns controller bus adapters (`publisher.rs`, `subscriber.rs`) that subscribe to `controller/input`, write to the PTY handler, and publish `controller/ack`.
+- `apps/beach` brings the unified bus up for every WebRTC transport and removed controller auto-attach gating/hints; controller actions flow only through the bus subscriber/publisher.
+- `apps/beach-manager` publishes controller inputs and listens for acks via new bus helpers; controller forwarder no longer depends on auto-attach metadata.
+- New tests run: `cargo test -p beach-buggy subscriber`, `cargo test -p beach-manager decode_ack_envelope`, `cargo test -p beach controller_input_ack_round_trip_ipc`.
+
 ## Prompt to hand to another Codex instance
 ```
 You are in /Users/arellidow/development/beach. Implement the unified transport pub/sub refactor per docs/transport-unified-bus-refactor.md:

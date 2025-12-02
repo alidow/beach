@@ -1,0 +1,115 @@
+x-dev-extra-hosts: &dev_extra_hosts
+  - "host.docker.internal:host-gateway"
+  - "api.beach.smoke:host-gateway"
+
+services:
+  redis-smoke:
+    image: redis:7-alpine
+    container_name: beach-redis-smoke
+    command: redis-server --appendonly yes
+    ports:
+      - "16379:6379"
+    networks: [beach-smoke-net]
+
+  beach-road-smoke:
+    image: rustlang/rust:nightly
+    container_name: beach-road-smoke
+    working_dir: /app
+    command:
+      - bash
+      - -lc
+      - |
+        export REDIS_URL=redis://beach-redis-smoke:6379
+        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-127.0.0.1}
+        exec /usr/local/cargo/bin/cargo run -p beach-road
+    environment:
+      REDIS_URL: redis://beach-redis-smoke:6379
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_PUBLIC_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_ROAD_PORT: 14132
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-127.0.0.1}
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-65000}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-65100}
+      RUST_LOG: info,beach_road::heartbeat=debug,beach_road::webrtc=debug
+    volumes:
+      - ../../..:/app
+      - cargo-target-smoke:/app/target
+      - cargo-registry-smoke:/usr/local/cargo/registry
+    depends_on:
+      - redis-smoke
+    ports:
+      - "14132:14132"
+    extra_hosts: *dev_extra_hosts
+    networks: [beach-smoke-net]
+
+  beach-manager-rewrite-smoke:
+    image: rustlang/rust:nightly
+    container_name: beach-manager-rewrite-smoke
+    working_dir: /app
+    command:
+      - bash
+      - -lc
+      - |
+        export REDIS_URL=redis://beach-redis-smoke:6379
+        export BEACH_MANAGER_BUS_MODE=${BEACH_MANAGER_BUS_MODE:-rtc}
+        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_MANAGER_REWRITE_ADDR=0.0.0.0:18081
+        exec /usr/local/cargo/bin/cargo run -p beach-manager-rewrite
+    environment:
+      REDIS_URL: redis://beach-redis-smoke:6379
+      BEACH_MANAGER_BUS_MODE: ${BEACH_MANAGER_BUS_MODE:-rtc}
+      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_MANAGER_REWRITE_ADDR: 0.0.0.0:18081
+      BEACH_MANAGER_INSTANCE_ID: beach-manager-rewrite-smoke
+      BEACH_MANAGER_CAPACITY: 50
+      RUST_LOG: info,beach_manager_rewrite=debug
+    volumes:
+      - ../../..:/app
+      - cargo-target-smoke:/app/target
+      - cargo-registry-smoke:/usr/local/cargo/registry
+    depends_on:
+      - beach-road-smoke
+    ports:
+      - "18081:18081"
+    extra_hosts: *dev_extra_hosts
+    networks: [beach-smoke-net]
+
+  beach-host-smoke:
+    image: rustlang/rust:nightly
+    container_name: beach-host-smoke
+    working_dir: /app
+    command:
+      - bash
+      - -lc
+      - |
+        export BEACH_SESSION_SERVER_BASE=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_SESSION_SERVER=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_MANAGER_BUS_MODE=rtc
+        exec /usr/local/cargo/bin/cargo run -p beach
+    environment:
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_MANAGER_BUS_MODE: rtc
+      RUST_LOG: info,beach=debug
+    volumes:
+      - ../../..:/app
+      - cargo-target-smoke:/app/target
+      - cargo-registry-smoke:/usr/local/cargo/registry
+    depends_on:
+      - beach-road-smoke
+      - beach-manager-rewrite-smoke
+    extra_hosts: *dev_extra_hosts
+    networks: [beach-smoke-net]
+
+networks:
+  beach-smoke-net:
+    driver: bridge
+
+volumes:
+  cargo-target-smoke:
+  cargo-registry-smoke:

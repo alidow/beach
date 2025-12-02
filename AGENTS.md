@@ -16,6 +16,14 @@ This file captures repo-wide tips for coding agents (Codex, Claude, etc.).
   are picked up. The only exception is the remote SSH bootstrap feature of
   `apps/beach`, which requires a pre-built binary; outside of that path,
   prebuilds are forbidden.
+- `apps/beach` is transport-only: it must not depend on Postgres or any DB. All
+  persistence (SeaORM/Postgres, assignment tables, etc.) lives in the manager
+  stack. Hosts talk over WebRTC/bus only; DB access is only from the manager or
+  other backend services running on the host machine.
+- When toggling managers, use `BEACH_MANAGER_IMPL=legacy|rewrite`. Inside
+  docker, legacy service is `http://beach-manager:8080`; rewrite is
+  `http://beach-manager-rewrite:8081`. `PRIVATE_BEACH_MANAGER_URL` should
+  reflect the chosen manager.
 
 ## Auth north star
 

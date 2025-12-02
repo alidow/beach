@@ -3,28 +3,22 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use beach_buggy::ActionCommand as CtrlActionCommand;
-use serde::Deserialize;
 use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::mcp::McpConfig;
-use crate::mcp::auth::{ControllerLeaseMetadata, LeaseManager, LeaseMetadata, LeaseScope};
+use crate::mcp::auth::LeaseManager;
 use crate::mcp::protocol::{
     JSONRPC_VERSION, JsonRpcRequest, JsonRpcResponse, JsonRpcResult, internal_error,
     invalid_params, method_not_found, unauthorized,
 };
 use crate::mcp::registry::{SessionRegistry, TerminalSession, global_registry};
-use crate::mcp::terminal::{
-    CONTROLLER_ACQUIRE, CONTROLLER_QUEUE_ACTIONS, CONTROLLER_RELEASE, TerminalSurface,
-};
+use crate::mcp::terminal::TerminalSurface;
 
 pub struct McpServer {
     config: McpConfig,
@@ -249,7 +243,6 @@ struct SubscriptionEntry {
 struct ConnectionState {
     outgoing: mpsc::Sender<serde_json::Value>,
     subscriptions: Mutex<HashMap<String, SubscriptionEntry>>,
-    controller_lease: Mutex<Option<ActiveControllerLease>>,
 }
 
 impl ConnectionState {
@@ -257,7 +250,6 @@ impl ConnectionState {
         Self {
             outgoing,
             subscriptions: Mutex::new(HashMap::new()),
-            controller_lease: Mutex::new(None),
         }
     }
 
@@ -280,28 +272,6 @@ impl ConnectionState {
             entry.task.abort();
         }
     }
-
-    async fn set_controller_lease(&self, lease: ActiveControllerLease) {
-        let mut guard = self.controller_lease.lock().await;
-        *guard = Some(lease);
-    }
-
-    async fn controller_lease(&self) -> Option<ActiveControllerLease> {
-        self.controller_lease.lock().await.clone()
-    }
-
-    async fn clear_controller_lease(&self, lease_id: Uuid) {
-        let mut guard = self.controller_lease.lock().await;
-        if guard.as_ref().map(|lease| lease.lease_id) == Some(lease_id) {
-            *guard = None;
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ActiveControllerLease {
-    session_id: String,
-    lease_id: Uuid,
 }
 
 struct McpService {
@@ -508,7 +478,7 @@ impl McpService {
 
     async fn tools_call(
         &self,
-        state: &Arc<ConnectionState>,
+        _state: &Arc<ConnectionState>,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, McpError> {
         let name = params
@@ -525,9 +495,6 @@ impl McpService {
                 crate::mcp::terminal::handle_list_sessions(&self.leases, &arguments)
                     .map_err(|err| McpError::internal(err.to_string()))
             }
-            CONTROLLER_ACQUIRE => self.handle_controller_acquire(state, &arguments).await,
-            CONTROLLER_RELEASE => self.handle_controller_release(state, &arguments).await,
-            CONTROLLER_QUEUE_ACTIONS => self.handle_controller_queue(state, &arguments).await,
             _ => {
                 let session_id = arguments
                     .get("session_id")
@@ -558,172 +525,6 @@ impl McpService {
             return Err(McpError::unauthorized("session not permitted"));
         }
         Ok(TerminalSurface::new(session))
-    }
-
-    async fn handle_controller_acquire(
-        &self,
-        state: &Arc<ConnectionState>,
-        params: &serde_json::Value,
-    ) -> Result<serde_json::Value, McpError> {
-        #[derive(Deserialize)]
-        struct AcquireArgs {
-            session_id: String,
-            #[serde(default)]
-            ttl_ms: Option<u64>,
-            #[serde(default)]
-            reason: Option<String>,
-        }
-        let args: AcquireArgs = serde_json::from_value(params.clone())
-            .map_err(|err| McpError::invalid(format!("invalid params: {err}")))?;
-        let surface = self.resolve_surface(&args.session_id)?;
-        let bridge = surface
-            .controller_bridge()
-            .ok_or_else(|| McpError::invalid("controller bridge unavailable"))?;
-        let grant = bridge
-            .acquire_controller_lease(&args.session_id, args.ttl_ms, args.reason.clone())
-            .await
-            .map_err(McpError::internal)?;
-        let ttl = grant.ttl_duration().unwrap_or_else(|| {
-            Duration::from_millis(args.ttl_ms.unwrap_or(30_000).clamp(1000, 120_000))
-        });
-        let metadata = LeaseMetadata::Controller(ControllerLeaseMetadata {
-            controller_token: grant.controller_token().to_string(),
-        });
-        let info = self
-            .leases
-            .acquire(
-                &args.session_id,
-                LeaseScope::Controller,
-                ttl,
-                Some(metadata),
-            )
-            .map_err(|err| McpError::internal(err.to_string()))?;
-        state
-            .set_controller_lease(ActiveControllerLease {
-                session_id: args.session_id.clone(),
-                lease_id: info.lease_id,
-            })
-            .await;
-        Ok(serde_json::json!({
-            "lease_id": info.lease_id.to_string(),
-            "expires_at": info.expires_at,
-            "controller_token": grant.controller_token(),
-            "controller_expires_at_ms": grant.expires_at_ms(),
-        }))
-    }
-
-    async fn handle_controller_release(
-        &self,
-        state: &Arc<ConnectionState>,
-        params: &serde_json::Value,
-    ) -> Result<serde_json::Value, McpError> {
-        #[derive(Deserialize)]
-        struct ReleaseArgs {
-            session_id: String,
-            #[serde(default)]
-            lease_id: Option<String>,
-            #[serde(default)]
-            controller_token: Option<String>,
-        }
-        let args: ReleaseArgs = serde_json::from_value(params.clone())
-            .map_err(|err| McpError::invalid(format!("invalid params: {err}")))?;
-        let surface = self.resolve_surface(&args.session_id)?;
-        let bridge = surface
-            .controller_bridge()
-            .ok_or_else(|| McpError::invalid("controller bridge unavailable"))?;
-        let lease_id = self
-            .resolve_controller_lease(state, &args.session_id, args.lease_id.as_deref())
-            .await?;
-        let token = if let Some(token) = args.controller_token.clone() {
-            token
-        } else {
-            self.controller_token_for_lease(lease_id)?
-        };
-        bridge
-            .release_controller_lease(&args.session_id, &token)
-            .await
-            .map_err(McpError::internal)?;
-        self.leases
-            .release(lease_id)
-            .map_err(|err| McpError::internal(err.to_string()))?;
-        state.clear_controller_lease(lease_id).await;
-        Ok(serde_json::json!({"status": "released"}))
-    }
-
-    async fn handle_controller_queue(
-        &self,
-        state: &Arc<ConnectionState>,
-        params: &serde_json::Value,
-    ) -> Result<serde_json::Value, McpError> {
-        #[derive(Deserialize)]
-        struct QueueArgs {
-            session_id: String,
-            actions: Vec<CtrlActionCommand>,
-            #[serde(default)]
-            lease_id: Option<String>,
-            #[serde(default)]
-            controller_token: Option<String>,
-            #[serde(default)]
-            trace_id: Option<String>,
-        }
-        let args: QueueArgs = serde_json::from_value(params.clone())
-            .map_err(|err| McpError::invalid(format!("invalid params: {err}")))?;
-        if args.actions.is_empty() {
-            return Err(McpError::invalid("actions array required"));
-        }
-        let surface = self.resolve_surface(&args.session_id)?;
-        let bridge = surface
-            .controller_bridge()
-            .ok_or_else(|| McpError::invalid("controller bridge unavailable"))?;
-        let lease_id = self
-            .resolve_controller_lease(state, &args.session_id, args.lease_id.as_deref())
-            .await?;
-        self.leases
-            .validate(&args.session_id, LeaseScope::Controller, Some(lease_id))
-            .map_err(|err| McpError::internal(err.to_string()))?;
-        let token = if let Some(token) = args.controller_token.clone() {
-            token
-        } else {
-            self.controller_token_for_lease(lease_id)?
-        };
-        let outcome = bridge
-            .queue_actions(
-                &args.session_id,
-                &token,
-                args.actions,
-                args.trace_id.clone(),
-            )
-            .await
-            .map_err(McpError::internal)?;
-        Ok(serde_json::json!({
-            "status": "queued",
-            "transport": if outcome.via_fast_path { "webrtc" } else { "http" },
-            "queued": outcome.queued,
-        }))
-    }
-
-    async fn resolve_controller_lease(
-        &self,
-        state: &Arc<ConnectionState>,
-        session_id: &str,
-        provided: Option<&str>,
-    ) -> Result<Uuid, McpError> {
-        if let Some(raw) = provided {
-            return Uuid::parse_str(raw).map_err(|_| McpError::invalid("invalid lease_id"));
-        }
-        if let Some(lease) = state.controller_lease().await {
-            if lease.session_id == session_id {
-                return Ok(lease.lease_id);
-            }
-        }
-        Err(McpError::invalid("controller lease required"))
-    }
-
-    fn controller_token_for_lease(&self, lease_id: Uuid) -> Result<String, McpError> {
-        match self.leases.metadata(lease_id) {
-            Some(LeaseMetadata::Controller(meta)) => Ok(meta.controller_token.clone()),
-            _ => Err(McpError::invalid("controller token unavailable for lease")),
-        }
     }
 }
 

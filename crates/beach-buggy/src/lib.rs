@@ -35,6 +35,14 @@ use tracing::{debug, info, trace, warn};
 use crate::fast_path::{parse_fast_path_endpoints, FastPathClient, FastPathConnection};
 
 pub mod fast_path;
+pub mod publisher;
+pub mod subscriber;
+
+pub use publisher::{
+    ControllerBusPublisher, TOPIC_CONTROLLER_ACK, TOPIC_CONTROLLER_HEALTH, TOPIC_CONTROLLER_INPUT,
+    TOPIC_CONTROLLER_STATE,
+};
+pub use subscriber::{ControllerBusSubscriber, TerminalWriter};
 
 /// Convenient result alias used throughout the harness.
 pub type HarnessResult<T> = Result<T, HarnessError>;

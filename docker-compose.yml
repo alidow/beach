@@ -95,6 +95,49 @@ services:
     networks:
       beach-network:
         ipv4_address: 172.28.0.100
+  beach-manager-rewrite:
+    image: rustlang/rust:nightly
+    container_name: beach-manager-rewrite
+    working_dir: /app
+    env_file:
+      - .env
+      - .env.local
+    command:
+      - bash
+      - -lc
+      - |
+        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-127.0.0.1}
+        : > /var/log/beach-manager/beach-manager-rewrite.log
+        exec /app/scripts/docker/beach-manager-entry.sh cargo run -p beach-manager-rewrite
+    environment:
+      BEACH_MANAGER_INSTANCE_ID: ${BEACH_MANAGER_INSTANCE_ID:-beach-manager-rewrite-1}
+      BEACH_MANAGER_CAPACITY: ${BEACH_MANAGER_CAPACITY:-50}
+      BEACH_QUEUE_BACKEND: ${BEACH_QUEUE_BACKEND:-memory}
+      REDIS_URL: redis://beach-redis:6379
+      DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
+      BEACH_MANAGER_REWRITE_ADDR: 0.0.0.0:8081
+      BEACH_MANAGER_IMPL: ${BEACH_MANAGER_IMPL:-legacy}
+      PRIVATE_BEACH_MANAGER_URL: http://beach-manager-rewrite:8081
+    volumes:
+      - .:/app
+      - ./config/dev-secrets:/secrets:ro
+      - cargo-target:/app/target
+      - cargo-registry-beach-manager:/usr/local/cargo/registry
+      - ./logs/beach-manager:/var/log/beach-manager
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      beach-gate:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+      - "64000-64100:64000-64100/udp"
+    extra_hosts: *dev_extra_hosts
+    networks:
+      beach-network:
+        ipv4_address: 172.28.0.101
   beach-road:
     image: rustlang/rust:nightly
     container_name: beach-road

@@ -303,6 +303,7 @@ pub(crate) fn host_frame_label(frame: &HostFrame) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn client_frame_label(frame: &WireClientFrame) -> &'static str {
     match frame {
         WireClientFrame::Input { .. } => "input",
@@ -801,6 +802,7 @@ impl TerminalDeltaStream for TimelineDeltaStream {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) enum ForwarderCommand {
     AddTransport {
         transport: Arc<dyn Transport>,

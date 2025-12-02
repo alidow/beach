@@ -42,6 +42,7 @@ url = "2"
 rand = "0.8"
 hex = "0.4"
 bytes = "1"
+transport-bus = { path = "../../crates/transport-bus" }
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt", "macros", "test-util"] }

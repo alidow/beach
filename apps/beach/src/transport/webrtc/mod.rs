@@ -50,10 +50,7 @@ use crate::auth;
 use crate::auth::error::AuthError;
 use crate::auth::gate::TurnIceServer;
 use crate::metrics;
-use crate::server::terminal::host::{
-    CONTROLLER_ACK_CHANNEL_LABEL, CONTROLLER_CHANNEL_LABEL, CONTROLLER_STATE_CHANNEL_LABEL,
-    LEGACY_CONTROLLER_CHANNEL_LABEL,
-};
+use crate::server::terminal::host::CONTROLLER_CHANNEL_LABEL;
 use crate::transport::framed;
 use crate::transport::webrtc::signaling::PeerInfo;
 use crate::transport::{
@@ -2089,12 +2086,7 @@ impl OffererInner {
 
     fn peer_is_controller(peer: &PeerInfo) -> bool {
         Self::peer_label(peer)
-            .map(|label| {
-                matches!(
-                    label.as_str(),
-                    CONTROLLER_CHANNEL_LABEL | LEGACY_CONTROLLER_CHANNEL_LABEL
-                )
-            })
+            .map(|label| matches!(label.as_str(), "mgr-actions" | "pb-controller"))
             .unwrap_or(false)
     }
 
@@ -2103,10 +2095,10 @@ impl OffererInner {
             .map(|label| {
                 matches!(
                     label.as_str(),
-                    CONTROLLER_CHANNEL_LABEL
-                        | LEGACY_CONTROLLER_CHANNEL_LABEL
-                        | CONTROLLER_ACK_CHANNEL_LABEL
-                        | CONTROLLER_STATE_CHANNEL_LABEL
+                    "mgr-actions"
+                        | "pb-controller"
+                        | "mgr-acks"
+                        | "mgr-state"
                         | "private-beach-dashboard"
                         | "beach-manager"
                 )
@@ -4887,6 +4879,7 @@ struct JwksResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ManagerClaims {
     #[serde(default)]
     iss: Option<String>,

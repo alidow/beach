@@ -20,8 +20,9 @@ Options:
                         if no beach id is provided. Requires manager token scopes.
 
 Environment variables:
-  PONG_DOCKER_SERVICE   Docker compose service name (default: beach-manager)
-  PRIVATE_BEACH_MANAGER_URL  Manager URL inside the container (default: http://localhost:8080)
+  PONG_MANAGER_IMPL     legacy|rewrite (default: legacy) to select manager service/port
+  PONG_DOCKER_SERVICE   Docker compose service name (default: beach-manager; auto-set if impl=rewrite)
+  PRIVATE_BEACH_MANAGER_URL  Manager URL inside the container (default: http://localhost:8080; auto-set if impl=rewrite)
   PONG_SESSION_SERVER   Beach session server URL (default: http://localhost:4132/)
   PONG_LOG_DIR          Log directory inside the container (default: /tmp/pong-stack)
   PONG_CODES_WAIT       Seconds to wait before printing session codes (default: 8)
@@ -77,8 +78,14 @@ fi
 COMMAND=$1
 shift
 
-SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
-MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
+PONG_MANAGER_IMPL=${PONG_MANAGER_IMPL:-legacy}
+if [[ "$PONG_MANAGER_IMPL" == "rewrite" ]]; then
+  SERVICE=${PONG_DOCKER_SERVICE:-beach-manager-rewrite}
+  MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8081}
+else
+  SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
+  MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
+fi
 SESSION_SERVER_BASE=${BEACH_SESSION_SERVER_BASE:-}
 SESSION_SERVER=${SESSION_SERVER_BASE:-${PONG_SESSION_SERVER:-http://api.beach.dev:4132/}}
 AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://beach-gate:4133}

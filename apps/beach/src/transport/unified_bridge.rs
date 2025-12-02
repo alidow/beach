@@ -9,31 +9,28 @@ use beach_buggy::{
 use futures::stream;
 use serde_json::json;
 use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, warn};
 use transport_bus::Bus;
 
-use crate::metrics;
 use crate::protocol::{ExtensionFrame, HostFrame};
-use crate::transport::{
-    ExtensionDirection, ExtensionLane, Transport,
-    bus::{UnifiedBus, manager_bus_from_client},
-    extensions,
-};
+use crate::transport::{Transport, bus::manager_bus_from_client, extensions};
+use transport_unified_adapter::UnifiedBus;
 
+#[allow(dead_code)]
 const BUS_NAMESPACE: &str = "manager";
+#[allow(dead_code)]
 const LEGACY_NAMESPACE: &str = "fastpath";
-const TOPIC_ACTION: &str = "controller/input";
-const TOPIC_ACK: &str = "controller/ack";
-const TOPIC_STATE: &str = "controller/state";
-const TOPIC_HEALTH: &str = "controller/health";
+// Preferred topics
+const TOPIC_ACTION: &str = "beach.manager.action";
+const TOPIC_ACK: &str = "beach.manager.ack";
+const TOPIC_STATE: &str = "beach.manager.state";
+const TOPIC_HEALTH: &str = "beach.manager.health";
+// Legacy topics still honored for compatibility (input only)
+const LEGACY_TOPIC_ACTION: &str = "controller/input";
 const KIND_ACTION: &str = "action";
 const KIND_ACK: &str = "ack";
 const KIND_STATE: &str = "state";
 const KIND_HEALTH: &str = "health";
-const CONTROLLER_KIND_INPUT: &str = "controller/input";
-const CONTROLLER_KIND_ACK: &str = "controller/ack";
-const CONTROLLER_KIND_STATE: &str = "controller/state";
-const CONTROLLER_KIND_HEALTH: &str = "controller/health";
 
 /// Bridge that adapts a negotiated [`Transport`] to Beach Buggy's `ManagerTransport` trait
 /// using unified transport extension frames.
@@ -60,6 +57,32 @@ impl UnifiedBuggyTransport {
     fn new_with_pump(transport: Arc<dyn Transport>) -> Self {
         let (actions_tx, actions_rx) = broadcast::channel(64);
         let bus = Arc::new(manager_bus_from_client(transport.clone()));
+        // Pump raw extension frames from the transport into the bus so subscribers see them.
+        {
+            let transport_clone = transport.clone();
+            let bus_clone = bus.clone();
+            tokio::spawn(async move {
+                loop {
+                    match transport_clone.try_recv() {
+                        Ok(Some(message)) => {
+                            if let crate::transport::Payload::Binary(bytes) = message.payload {
+                                if let Ok(HostFrame::Extension { frame }) =
+                                    crate::protocol::decode_host_frame_binary(&bytes)
+                                {
+                                    let topic = frame.kind.clone();
+                                    let _ =
+                                        bus_clone.publish(topic.as_str(), frame.payload.clone());
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(crate::transport::TransportError::Timeout) => break,
+                        Err(crate::transport::TransportError::ChannelClosed) => break,
+                        Err(crate::transport::TransportError::Setup(_)) => break,
+                    }
+                }
+            });
+        }
         // Subscribe to bus topic for controller input and forward into actions_tx.
         {
             let mut bus_rx = bus.subscribe(TOPIC_ACTION);
@@ -79,14 +102,6 @@ impl UnifiedBuggyTransport {
             bus,
             actions_tx,
             actions_rx: Arc::new(Mutex::new(actions_rx)),
-        }
-    }
-
-    fn make_frame(kind: &str, payload: impl Into<Vec<u8>>) -> ExtensionFrame {
-        ExtensionFrame {
-            namespace: BUS_NAMESPACE.to_string(),
-            kind: kind.to_string(),
-            payload: payload.into().into(),
         }
     }
 
@@ -112,27 +127,6 @@ impl UnifiedBuggyTransport {
         Ok(actions)
     }
 
-    async fn send_extension_frame(
-        &self,
-        direction: ExtensionDirection,
-        frame: ExtensionFrame,
-    ) -> HarnessResult<()> {
-        self.transport
-            .send_extension(direction, frame.clone(), ExtensionLane::ControlOrdered)
-            .map(|_| ())
-            .map_err(|err| HarnessError::Transport(err.to_string()))
-            .map(|_| {
-                metrics::EXTENSION_SENT
-                    .with_label_values(&[
-                        &frame.namespace,
-                        &frame.kind,
-                        direction_role(direction),
-                        "unified",
-                    ])
-                    .inc();
-            })
-    }
-
     fn encode_payload(kind: &str, value: serde_json::Value) -> HarnessResult<Vec<u8>> {
         let envelope = json!({ "type": kind, "payload": value });
         serde_json::to_vec(&envelope)
@@ -141,10 +135,10 @@ impl UnifiedBuggyTransport {
 
     async fn send_controller_frame(&self, kind: &str, payload: Vec<u8>) -> HarnessResult<()> {
         let topic = match kind {
-            KIND_ACTION | CONTROLLER_KIND_INPUT => TOPIC_ACTION,
-            KIND_ACK | CONTROLLER_KIND_ACK => TOPIC_ACK,
-            KIND_STATE | CONTROLLER_KIND_STATE => TOPIC_STATE,
-            KIND_HEALTH | CONTROLLER_KIND_HEALTH => TOPIC_HEALTH,
+            KIND_ACTION => TOPIC_ACTION,
+            KIND_ACK => TOPIC_ACK,
+            KIND_STATE => TOPIC_STATE,
+            KIND_HEALTH => TOPIC_HEALTH,
             other => other,
         };
         self.bus
@@ -153,25 +147,22 @@ impl UnifiedBuggyTransport {
     }
 
     pub fn ingest_extension_frame(&self, frame: ExtensionFrame) {
-        if (frame.namespace == BUS_NAMESPACE || frame.namespace == LEGACY_NAMESPACE)
-            && frame.kind == TOPIC_ACTION
-        {
-            if let Ok(text) = std::str::from_utf8(&frame.payload) {
-                if let Ok(action) = parse_action_payload(text) {
-                    let _ = self.actions_tx.send(action);
+        let kind = frame.kind.as_str();
+        match kind {
+            TOPIC_ACTION | LEGACY_TOPIC_ACTION => {
+                if let Ok(text) = std::str::from_utf8(&frame.payload) {
+                    if let Ok(action) = parse_action_payload(text) {
+                        let _ = self.actions_tx.send(action);
+                    }
                 }
             }
-            return;
+            TOPIC_ACK | TOPIC_STATE | TOPIC_HEALTH => {
+                let _ = self.bus.publish(kind, frame.payload.clone());
+            }
+            _ => {
+                extensions::publish(self.transport.id(), frame);
+            }
         }
-        // Fallback: publish to per-transport extension bus for any listeners.
-        extensions::publish(self.transport.id(), frame);
-    }
-}
-
-fn direction_role(direction: ExtensionDirection) -> &'static str {
-    match direction {
-        ExtensionDirection::HostToClient => "host",
-        ExtensionDirection::ClientToHost => "controller",
     }
 }
 
@@ -199,8 +190,7 @@ impl ManagerTransport for UnifiedBuggyTransport {
 
     async fn send_state(&self, _session_id: &str, diff: StateDiff) -> HarnessResult<()> {
         let payload = Self::encode_payload(KIND_STATE, json!(diff))?;
-        self.send_controller_frame(CONTROLLER_KIND_STATE, payload)
-            .await
+        self.send_controller_frame(TOPIC_STATE, payload).await
     }
 
     async fn receive_actions(&self, _session_id: &str) -> HarnessResult<Vec<ActionCommand>> {
@@ -210,8 +200,7 @@ impl ManagerTransport for UnifiedBuggyTransport {
     async fn ack_actions(&self, _session_id: &str, acks: Vec<ActionAck>) -> HarnessResult<()> {
         for ack in acks {
             let payload = Self::encode_payload(KIND_ACK, json!(ack))?;
-            self.send_controller_frame(CONTROLLER_KIND_ACK, payload)
-                .await?;
+            self.send_controller_frame(TOPIC_ACK, payload).await?;
         }
         Ok(())
     }
@@ -222,8 +211,7 @@ impl ManagerTransport for UnifiedBuggyTransport {
         heartbeat: HealthHeartbeat,
     ) -> HarnessResult<()> {
         let payload = Self::encode_payload(KIND_HEALTH, json!(heartbeat))?;
-        self.send_controller_frame(CONTROLLER_KIND_HEALTH, payload)
-            .await
+        self.send_controller_frame(TOPIC_HEALTH, payload).await
     }
 }
 
@@ -259,8 +247,9 @@ impl ControllerTransport for UnifiedBuggyTransport {
 mod tests {
     use super::*;
     use crate::ClientFrame;
-    use crate::transport::{TransportKind, TransportPair};
+    use crate::transport::{ExtensionDirection, TransportKind, TransportPair, bus::UnifiedBus};
     use std::time::Duration;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn actions_flow_over_extension_frames() {
@@ -381,5 +370,58 @@ mod tests {
 
         let actions = bridge.receive_actions("sess").await.unwrap();
         assert!(actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bus_action_ack_roundtrip() {
+        use beach_buggy::fast_path::parse_action_payload;
+
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let server: Arc<dyn Transport> = Arc::from(pair.server);
+        let bus = Arc::new(UnifiedBus::new(
+            server,
+            ExtensionDirection::HostToClient,
+            BUS_NAMESPACE,
+        ));
+
+        let mut action_rx = bus.subscribe(TOPIC_ACTION);
+        let mut ack_rx = bus.subscribe(TOPIC_ACK);
+
+        // Simulate host/buggy handler: receive action and emit ack.
+        let bus_for_handler = Arc::clone(&bus);
+        tokio::spawn(async move {
+            if let Ok(msg) = action_rx.recv().await {
+                if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                    if let Ok(action) = parse_action_payload(text) {
+                        let ack = ActionAck {
+                            id: action.id.clone(),
+                            status: beach_buggy::AckStatus::Ok,
+                            applied_at: std::time::SystemTime::now(),
+                            latency_ms: None,
+                            error_code: None,
+                            error_message: None,
+                        };
+                        let _ = bus_for_handler
+                            .publish(TOPIC_ACK, serde_json::to_vec(&ack).unwrap().into());
+                    }
+                }
+            }
+        });
+
+        let action = ActionCommand {
+            id: "test-action".into(),
+            action_type: "terminal_write".into(),
+            payload: serde_json::json!({ "bytes": "ping" }),
+            expires_at: None,
+        };
+        bus.publish(TOPIC_ACTION, serde_json::to_vec(&action).unwrap().into())
+            .expect("publish action");
+
+        let msg = timeout(Duration::from_secs(1), ack_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack msg");
+        let ack: ActionAck = serde_json::from_slice(&msg.payload).expect("parse ack payload");
+        assert_eq!(ack.id, "test-action");
     }
 }

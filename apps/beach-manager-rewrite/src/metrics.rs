@@ -22,6 +22,58 @@ pub static ASSIGNMENT_DECISIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static QUEUE_ENQUEUED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_queue_enqueued_total",
+            "messages enqueued into controller queue by kind",
+        ),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static QUEUE_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_queue_dropped_total",
+            "messages dropped by controller queue backpressure by kind",
+        ),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static PERSIST_SUCCESS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_persist_success_total",
+            "successful persistence operations by kind",
+        ),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static PERSIST_ERROR: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_persist_error_total",
+            "failed persistence operations by kind",
+        ),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub fn gather() -> Vec<u8> {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();

@@ -2,6 +2,7 @@ pub mod assignment;
 pub mod assignment_orm;
 pub mod assignment_postgres;
 pub mod assignment_redis;
+pub mod bus;
 pub mod bus_ingest;
 pub mod bus_publisher;
 pub mod config;

@@ -43,7 +43,7 @@ pub async fn ingest_message(topic: &str, payload: &[u8], queue: Arc<dyn Controll
     }
 }
 
-const MANAGER_TOPICS: &[&str] = &[
+pub const MANAGER_TOPICS: &[&str] = &[
     "beach.manager.action",
     "beach.manager.ack",
     "beach.manager.state",

@@ -35,8 +35,11 @@ wait_for_health() {
 
 set_host_env_from_logs() {
   logs=$(docker compose -f "$COMPOSE_FILE" logs beach-host-smoke 2>/dev/null || true)
-  host_id=$(echo "$logs" | awk '/session id/{print $NF; exit}')
-  host_pass=$(echo "$logs" | awk '/passcode/{print $NF; exit}')
+  # Use the most recent session/passcode in case the container restarted and emitted multiple
+  # registrations; picking the first entry can leave us with a stale host id that Road no longer
+  # knows about (causing RTC attach 404s).
+  host_id=$(echo "$logs" | awk '/session id/{id=$NF} END{print id}')
+  host_pass=$(echo "$logs" | awk '/passcode/{pass=$NF} END{print pass}')
   if [[ -n "$host_id" ]]; then
     export BEACH_RTC_TEST_HOST_SESSION_ID="$host_id"
     echo "Detected host session id: $BEACH_RTC_TEST_HOST_SESSION_ID"

@@ -6,10 +6,12 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::{Database, DatabaseConnection, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::assignment_orm::manager_assignments;
 use crate::assignment_postgres::PostgresAssignmentStore;
 use crate::config::AppConfig;
+use crate::metrics::{PERSIST_ERROR, PERSIST_SUCCESS};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerLeaseRecord {
@@ -54,6 +56,9 @@ pub trait PersistenceAdapter: Send + Sync {
         &self,
         assignment: ManagerAssignmentRecord,
     ) -> Result<(), PersistenceError>;
+
+    /// Optional hook for metrics to record errors; default no-op so adapters can override.
+    fn record_error(&self, _kind: &str) {}
 }
 
 #[derive(Default)]
@@ -113,12 +118,18 @@ impl PersistenceAdapter for InMemoryPersistence {
         self.assignments.lock().await.push(assignment);
         Ok(())
     }
+
+    fn record_error(&self, _kind: &str) {}
 }
 
 pub fn build_persistence(_cfg: &AppConfig) -> Arc<dyn PersistenceAdapter> {
     if let Some(url) = _cfg.database_url.as_deref() {
         if let Ok(db) = SeaOrmPersistence::connect_sync(url) {
             return Arc::new(db);
+        } else {
+            warn!(
+                "DATABASE_URL provided but Postgres adapter failed; falling back to Redis/memory"
+            );
         }
     }
     if let Some(url) = _cfg.redis_url.as_deref() {
@@ -168,7 +179,11 @@ impl PersistenceAdapter for RedisPersistence {
             .arg(payload)
             .query_async::<_, ()>(&mut conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["lease"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["lease"]).inc();
         Ok(())
     }
 
@@ -181,7 +196,11 @@ impl PersistenceAdapter for RedisPersistence {
             .arg(payload)
             .query_async::<_, ()>(&mut conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["action"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["action"]).inc();
         Ok(())
     }
 
@@ -197,7 +216,11 @@ impl PersistenceAdapter for RedisPersistence {
             .arg(payload)
             .query_async::<_, ()>(&mut conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["assignment"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["assignment"]).inc();
         Ok(())
     }
 }
@@ -257,7 +280,11 @@ impl PersistenceAdapter for SeaOrmPersistence {
             )
             .exec(&self.conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["lease"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["lease"]).inc();
         Ok(())
     }
 
@@ -284,7 +311,11 @@ impl PersistenceAdapter for SeaOrmPersistence {
             )
             .exec(&self.conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["action"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["action"]).inc();
         Ok(())
     }
 
@@ -310,7 +341,11 @@ impl PersistenceAdapter for SeaOrmPersistence {
             )
             .exec(&self.conn)
             .await
-            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                PERSIST_ERROR.with_label_values(&["assignment"]).inc();
+                PersistenceError::Backend(e.to_string())
+            })?;
+        PERSIST_SUCCESS.with_label_values(&["assignment"]).inc();
         Ok(())
     }
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use transport_bus::BusError;
+use serde::Serialize;
+use serde_json;
+use transport_bus::{Bus, BusError, BusMessage};
 use transport_unified_adapter::{ExtensionTransport, UnifiedBus};
 
 use crate::protocol::ExtensionFrame;
@@ -78,6 +80,76 @@ pub fn manager_bus_from_client(transport: Arc<dyn Transport>) -> UnifiedBus {
         ExtensionDirection::ClientToHost,
     ));
     UnifiedBus::new(bridge, DEFAULT_NAMESPACE)
+}
+
+/// Explicit manager topics for unified bus pub/sub.
+pub mod manager_topics {
+    pub const TOPIC_ACTION: &str = "beach.manager.action";
+    pub const TOPIC_ACK: &str = "beach.manager.ack";
+    pub const TOPIC_STATE: &str = "beach.manager.state";
+    pub const TOPIC_HEALTH: &str = "beach.manager.health";
+    pub const TOPICS: &[&str] = &[TOPIC_ACTION, TOPIC_ACK, TOPIC_STATE, TOPIC_HEALTH];
+}
+
+/// Manager-facing publisher for unified bus topics (host-side view).
+#[derive(Clone)]
+pub struct ManagerBusPublisher {
+    bus: Arc<UnifiedBus>,
+}
+
+impl ManagerBusPublisher {
+    pub fn new(bus: Arc<UnifiedBus>) -> Self {
+        Self { bus }
+    }
+
+    pub fn publish_action(&self, cmd: beach_buggy::ActionCommand) -> Result<(), BusError> {
+        self.publish(manager_topics::TOPIC_ACTION, "action", cmd)
+    }
+
+    pub fn publish_ack(&self, ack: beach_buggy::ActionAck) -> Result<(), BusError> {
+        self.publish(manager_topics::TOPIC_ACK, "ack", ack)
+    }
+
+    pub fn publish_state(&self, state: beach_buggy::StateDiff) -> Result<(), BusError> {
+        self.publish(manager_topics::TOPIC_STATE, "state", state)
+    }
+
+    pub fn publish_health(&self, payload: serde_json::Value) -> Result<(), BusError> {
+        self.publish(manager_topics::TOPIC_HEALTH, "health", payload)
+    }
+
+    fn publish<T: Serialize>(
+        &self,
+        topic: &str,
+        kind: &'static str,
+        payload: T,
+    ) -> Result<(), BusError> {
+        let env = serde_json::to_vec(&serde_json::json!({
+            "type": kind,
+            "payload": payload,
+        }))
+        .map_err(|err| BusError::Transport(err.to_string()))?;
+        self.bus.publish(topic, env.into())
+    }
+}
+
+/// Helper to subscribe to manager topics with explicit receivers for auditing.
+#[allow(dead_code)]
+pub struct ManagerSubscriptions {
+    pub action: tokio::sync::broadcast::Receiver<BusMessage>,
+    pub ack: tokio::sync::broadcast::Receiver<BusMessage>,
+    pub state: tokio::sync::broadcast::Receiver<BusMessage>,
+    pub health: tokio::sync::broadcast::Receiver<BusMessage>,
+}
+
+#[allow(dead_code)]
+pub fn subscribe_manager_topics(bus: &UnifiedBus) -> ManagerSubscriptions {
+    ManagerSubscriptions {
+        action: bus.subscribe(manager_topics::TOPIC_ACTION),
+        ack: bus.subscribe(manager_topics::TOPIC_ACK),
+        state: bus.subscribe(manager_topics::TOPIC_STATE),
+        health: bus.subscribe(manager_topics::TOPIC_HEALTH),
+    }
 }
 
 #[cfg(test)]

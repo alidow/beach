@@ -13,18 +13,22 @@ use tracing::{info, warn};
 use transport_bus::Bus;
 
 use crate::protocol::{ExtensionFrame, HostFrame};
-use crate::transport::{Transport, bus::manager_bus_from_client, extensions};
+use crate::transport::{
+    Transport,
+    bus::{manager_bus_from_client, manager_topics},
+    extensions,
+};
 use transport_unified_adapter::UnifiedBus;
 
 #[allow(dead_code)]
 const BUS_NAMESPACE: &str = "manager";
 #[allow(dead_code)]
 const LEGACY_NAMESPACE: &str = "fastpath";
-// Preferred topics
-const TOPIC_ACTION: &str = "beach.manager.action";
-const TOPIC_ACK: &str = "beach.manager.ack";
-const TOPIC_STATE: &str = "beach.manager.state";
-const TOPIC_HEALTH: &str = "beach.manager.health";
+// Preferred topics (pulled from shared bus topics for auditability)
+const TOPIC_ACTION: &str = manager_topics::TOPIC_ACTION;
+const TOPIC_ACK: &str = manager_topics::TOPIC_ACK;
+const TOPIC_STATE: &str = manager_topics::TOPIC_STATE;
+const TOPIC_HEALTH: &str = manager_topics::TOPIC_HEALTH;
 // Legacy topics still honored for compatibility (input only)
 const LEGACY_TOPIC_ACTION: &str = "controller/input";
 const KIND_ACTION: &str = "action";

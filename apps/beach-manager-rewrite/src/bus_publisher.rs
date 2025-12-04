@@ -6,13 +6,10 @@ use transport_bus::{Bus, BusResult};
 
 use crate::queue::{ActionAck, ActionCommand, StateDiff};
 
-const TOPIC_ACTION: &str = "beach.manager.action";
-#[allow(dead_code)]
-const TOPIC_ACK: &str = "beach.manager.ack";
-#[allow(dead_code)]
-const TOPIC_STATE: &str = "beach.manager.state";
-#[allow(dead_code)]
-const TOPIC_HEALTH: &str = "beach.manager.health";
+pub const TOPIC_ACTION: &str = "beach.manager.action";
+pub const TOPIC_ACK: &str = "beach.manager.ack";
+pub const TOPIC_STATE: &str = "beach.manager.state";
+pub const TOPIC_HEALTH: &str = "beach.manager.health";
 
 #[derive(Serialize, Deserialize)]
 struct Envelope<T> {

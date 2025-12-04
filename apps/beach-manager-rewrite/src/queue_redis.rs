@@ -7,6 +7,7 @@ use crate::queue::{ActionAck, ActionCommand, ControllerQueue, StateDiff};
 const LIST_ACTIONS: &str = "beach:rewrite:actions";
 const LIST_ACKS: &str = "beach:rewrite:acks";
 const LIST_STATES: &str = "beach:rewrite:states";
+const MAX_LIST_LEN: isize = 10_000; // basic backpressure cap per list
 
 pub struct RedisQueue {
     client: redis::Client,
@@ -30,6 +31,13 @@ impl RedisQueue {
         let mut conn = self.conn().await?;
         let payload = serde_json::to_string(value).map_err(to_redis_err)?;
         let _: () = conn.rpush(list, payload).await?;
+        // Trim to max length to prevent unbounded growth.
+        let _: () = redis::cmd("LTRIM")
+            .arg(list)
+            .arg(-MAX_LIST_LEN)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await?;
         Ok(())
     }
 
@@ -62,14 +70,23 @@ fn to_redis_err(err: impl std::error::Error) -> redis::RedisError {
 impl ControllerQueue for RedisQueue {
     async fn enqueue_action(&self, action: ActionCommand) {
         let _ = self.push_json(LIST_ACTIONS, &action).await;
+        crate::metrics::QUEUE_ENQUEUED
+            .with_label_values(&["action"])
+            .inc();
     }
 
     async fn enqueue_ack(&self, ack: ActionAck) {
         let _ = self.push_json(LIST_ACKS, &ack).await;
+        crate::metrics::QUEUE_ENQUEUED
+            .with_label_values(&["ack"])
+            .inc();
     }
 
     async fn enqueue_state(&self, state: StateDiff) {
         let _ = self.push_json(LIST_STATES, &state).await;
+        crate::metrics::QUEUE_ENQUEUED
+            .with_label_values(&["state"])
+            .inc();
     }
 
     async fn drain_actions(&self, max: usize) -> Vec<ActionCommand> {

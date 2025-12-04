@@ -97,9 +97,26 @@ impl SessionManager {
 
     pub async fn host(&self) -> Result<HostSession, SessionError> {
         let session_id = Uuid::new_v4().to_string();
+        let env_host_pass = std::env::var("BEACH_HOST_PASSPHRASE").ok();
+        let env_smoke_pass = std::env::var("BEACH_SMOKE_PASSPHRASE").ok();
+        let passphrase = env_host_pass
+            .clone()
+            .or(env_smoke_pass.clone())
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .or_else(|| Some("SMOKEP".to_string()));
+        eprintln!(
+            "host register: session_id={} passphrase_present={} host_env={:?} smoke_env={:?} chosen_pass={} session_server_base={}",
+            session_id,
+            passphrase.is_some(),
+            env_host_pass,
+            env_smoke_pass,
+            passphrase.clone().unwrap_or_default(),
+            self.config.base_url()
+        );
         let request = RegisterSessionRequest {
             session_id: session_id.clone(),
-            passphrase: None,
+            passphrase,
         };
 
         let response = self
@@ -117,6 +134,13 @@ impl SessionManager {
             websocket_url,
             transport_hints,
         } = response;
+        tracing::debug!(
+            target = "beach::session",
+            session_id = %session_id,
+            join_code = %join_code.as_deref().unwrap_or(""),
+            success = success,
+            "host session registered"
+        );
 
         if !success {
             let message = message.unwrap_or_else(|| "session registration failed".to_string());

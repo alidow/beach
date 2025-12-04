@@ -27,3 +27,4 @@ sea-orm = { version = "0.12", default-features = false, features = ["macros", "r
 futures = "0.3"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"

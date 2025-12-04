@@ -7,17 +7,28 @@ use crate::persistence::{
     ActionLogRecord, ControllerLeaseRecord, ManagerAssignmentRecord, PersistenceAdapter,
 };
 use crate::queue::ControllerQueue;
+use crate::state::SnapshotCache;
 
 pub async fn drain_once(
     queue: Arc<dyn ControllerQueue>,
     persistence: Arc<dyn PersistenceAdapter>,
     batch: usize,
+    snapshot: Option<SnapshotCache>,
 ) {
     let actions = queue.drain_actions(batch).await;
     let acks = queue.drain_acks(batch).await;
     let states = queue.drain_states(batch).await;
 
     for action in actions {
+        if let Some(host) = action
+            .payload
+            .get("host_session_id")
+            .and_then(|v| v.as_str())
+        {
+            if let Some(cache) = snapshot.as_ref() {
+                cache.update_action(host, &action.id);
+            }
+        }
         let record = ActionLogRecord {
             id: action.id.clone(),
             host_session_id: action
@@ -54,6 +65,15 @@ pub async fn drain_once(
     }
 
     for state in states {
+        if let Some(host) = state
+            .payload
+            .get("host_session_id")
+            .and_then(|v| v.as_str())
+        {
+            if let Some(cache) = snapshot.as_ref() {
+                cache.update_state(host, state.sequence);
+            }
+        }
         let record = ManagerAssignmentRecord {
             host_session_id: state
                 .payload
@@ -81,12 +101,13 @@ pub fn start_pipeline(
     persistence: Arc<dyn PersistenceAdapter>,
     batch: usize,
     interval_ms: u64,
+    snapshot: Option<SnapshotCache>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
         loop {
             ticker.tick().await;
-            drain_once(queue.clone(), persistence.clone(), batch).await;
+            drain_once(queue.clone(), persistence.clone(), batch, snapshot.clone()).await;
         }
     })
 }

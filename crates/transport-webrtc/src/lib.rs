@@ -12,7 +12,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use transport_bus::{Bus, BusError};
 use transport_unified_adapter::{
     ExtensionFrame, ExtensionTransport, UnifiedBus, UnifiedBusAdapter, UnifiedBusError,
@@ -166,12 +166,24 @@ fn poll_interval_ms() -> u64 {
 }
 
 /// Build a negotiated ExtensionTransport backed by the unified WebRTC channel.
+fn attach_passphrase() -> Option<String> {
+    std::env::var("BEACH_WEBRTC_ATTACH_PASSPHRASE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 pub async fn attach_and_build_transport(
     session_server_base: &str,
     host_session_id: &str,
+    passphrase: Option<&str>,
 ) -> Result<Arc<dyn ExtensionTransport>, WebRtcError> {
     let session_base = session_base_from_env(session_server_base);
     let signaling_url = build_signaling_url(&session_base, host_session_id)?;
+    let passphrase = passphrase
+        .map(|p| p.to_string())
+        .or_else(attach_passphrase)
+        .unwrap_or_default();
     let mut metadata = HashMap::new();
     metadata.insert("host_session_id".to_string(), host_session_id.to_string());
     if let Ok(instance) = std::env::var("BEACH_MANAGER_INSTANCE_ID") {
@@ -179,19 +191,43 @@ pub async fn attach_and_build_transport(
     }
     info!(
         signaling_url,
-        host_session_id, "attaching rtc transport to host session"
+        session_base = %session_base,
+        host_session_id,
+        passphrase_present = %!passphrase.is_empty(),
+        "attaching rtc transport to host session"
+    );
+    debug!(
+        host_session_id,
+        signaling_url,
+        passphrase_present = %!passphrase.is_empty(),
+        "rtc attach: calling connect_via_signaling"
     );
     let connection = connect_via_signaling(
         signaling_url.as_str(),
         WebRtcRole::Answerer,
         Duration::from_millis(poll_interval_ms()),
-        None,
+        Some(passphrase.as_str()),
         Some(MANAGER_LABEL),
         false,
         Some(metadata),
     )
     .await
-    .map_err(WebRtcError::Transport)?;
+    .map_err(|err| {
+        error!(
+            host_session_id,
+            signaling_url,
+            passphrase_present = %!passphrase.is_empty(),
+            error = ?err,
+            "rtc transport negotiation failed (connect_via_signaling)"
+        );
+        WebRtcError::Transport(err)
+    })?;
+    debug!(
+        host_session_id,
+        signaling_url,
+        passphrase_present = %!passphrase.is_empty(),
+        "rtc attach: connect_via_signaling succeeded"
+    );
     let transport =
         WebRtcExtensionTransport::new(connection.transport(), ExtensionDirection::ClientToHost);
     debug!(
@@ -206,6 +242,7 @@ pub async fn attach_and_build_transport(
 pub struct RtcUnifiedAdapter {
     session_base: String,
     namespace: String,
+    passphrase: Option<String>,
 }
 
 impl RtcUnifiedAdapter {
@@ -213,6 +250,7 @@ impl RtcUnifiedAdapter {
         Self {
             session_base: session_base.into(),
             namespace: DEFAULT_NAMESPACE.to_string(),
+            passphrase: attach_passphrase(),
         }
     }
 
@@ -220,14 +258,26 @@ impl RtcUnifiedAdapter {
         self.namespace = namespace.into();
         self
     }
+
+    pub fn with_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        let pass = passphrase.into();
+        if !pass.trim().is_empty() {
+            self.passphrase = Some(pass);
+        }
+        self
+    }
 }
 
 #[async_trait]
 impl UnifiedBusAdapter for RtcUnifiedAdapter {
     async fn build_bus(&self, host_session_id: &str) -> Result<Arc<dyn Bus>, UnifiedBusError> {
-        let transport = attach_and_build_transport(&self.session_base, host_session_id)
-            .await
-            .map_err(|err| UnifiedBusError::NotReady(err.to_string()))?;
+        let transport = attach_and_build_transport(
+            &self.session_base,
+            host_session_id,
+            self.passphrase.as_deref(),
+        )
+        .await
+        .map_err(|err| UnifiedBusError::NotReady(err.to_string()))?;
         Ok(Arc::new(UnifiedBus::new(transport, self.namespace.clone())))
     }
 }

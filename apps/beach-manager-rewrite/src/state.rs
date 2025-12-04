@@ -5,7 +5,11 @@ use crate::assignment::AssignmentService;
 use crate::bus_ingest;
 use crate::persistence::PersistenceAdapter;
 use crate::queue::ControllerQueue;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::time::SystemTime;
 use tokio::task::JoinHandle;
+use tracing::info;
 use transport_bus::Bus;
 use transport_unified_adapter::{UnifiedBusAdapter, UnifiedBusError};
 
@@ -21,6 +25,7 @@ pub struct AppState {
     #[allow(dead_code)]
     assignment: AssignmentService,
     bus_adapter: Option<Arc<dyn UnifiedBusAdapter>>,
+    snapshot: SnapshotCache,
 }
 
 impl AppState {
@@ -32,6 +37,7 @@ impl AppState {
         assignment: AssignmentService,
         bus_adapter: Option<Arc<dyn UnifiedBusAdapter>>,
     ) -> Self {
+        let snapshot = SnapshotCache::default();
         Self {
             start: Instant::now(),
             instance_id,
@@ -40,6 +46,7 @@ impl AppState {
             persistence,
             assignment,
             bus_adapter,
+            snapshot,
         }
     }
 
@@ -79,8 +86,64 @@ impl AppState {
         let Some(adapter) = &self.bus_adapter else {
             return Ok(());
         };
+        info!(
+            host_session_id,
+            "attaching unified bus for host via configured adapter"
+        );
         let bus = adapter.build_bus(host_session_id).await?;
         let _handles = self.attach_bus(bus);
+        info!(host_session_id, "bus attached and ingest started");
         Ok(())
+    }
+
+    pub fn snapshot(&self) -> SnapshotCache {
+        self.snapshot.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SnapshotCache {
+    inner: Arc<Mutex<HashMap<String, CacheSnapshot>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CacheSnapshot {
+    pub host_session_id: String,
+    pub last_action_id: Option<String>,
+    pub last_state_seq: Option<u64>,
+    pub last_updated: SystemTime,
+}
+
+impl SnapshotCache {
+    pub fn update_action(&self, host_session_id: &str, action_id: &str) {
+        let mut guard = self.inner.lock();
+        let entry = guard
+            .entry(host_session_id.to_string())
+            .or_insert(CacheSnapshot {
+                host_session_id: host_session_id.to_string(),
+                last_action_id: None,
+                last_state_seq: None,
+                last_updated: SystemTime::now(),
+            });
+        entry.last_action_id = Some(action_id.to_string());
+        entry.last_updated = SystemTime::now();
+    }
+
+    pub fn update_state(&self, host_session_id: &str, seq: u64) {
+        let mut guard = self.inner.lock();
+        let entry = guard
+            .entry(host_session_id.to_string())
+            .or_insert(CacheSnapshot {
+                host_session_id: host_session_id.to_string(),
+                last_action_id: None,
+                last_state_seq: None,
+                last_updated: SystemTime::now(),
+            });
+        entry.last_state_seq = Some(seq);
+        entry.last_updated = SystemTime::now();
+    }
+
+    pub fn get(&self, host_session_id: &str) -> Option<CacheSnapshot> {
+        self.inner.lock().get(host_session_id).cloned()
     }
 }

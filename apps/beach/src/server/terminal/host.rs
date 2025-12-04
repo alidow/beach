@@ -35,7 +35,9 @@ use crate::terminal::cli::{BootstrapOutput, HostArgs};
 use crate::terminal::config::cursor_sync_enabled;
 use crate::terminal::error::CliError;
 use crate::transport as transport_mod;
-use crate::transport::terminal::negotiation::SharedTransport;
+use crate::transport::terminal::negotiation::{
+    HeartbeatPublisher, NegotiatedTransport, SharedTransport, negotiate_transport,
+};
 use crate::transport::unified_bridge::UnifiedBuggyTransport;
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
@@ -466,6 +468,10 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         (None, None)
     };
 
+    info!(
+        session_id = %session_id,
+        "spawning webrtc acceptor (host offerer)"
+    );
     let accept_task = spawn_webrtc_acceptor(
         session_id.clone(),
         session_handle.clone(),
@@ -1093,26 +1099,86 @@ fn spawn_local_stdin_forwarder(
 }
 
 fn spawn_webrtc_acceptor(
-    _session_id: String,
-    _session_handle: SessionHandle,
-    _join_code: Option<String>,
-    _writer: PtyWriter,
+    session_id: String,
+    session_handle: SessionHandle,
+    join_code: Option<String>,
+    writer: PtyWriter,
     _process_handle: Arc<PtyProcess>,
     _emulator_handle: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
     _grid: Arc<TerminalGrid>,
     _backfill_tx: UnboundedSender<BackfillCommand>,
     _input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     _forwarder_cmd_tx: UnboundedSender<ForwarderCommand>,
-    _transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
     _authorizer: Arc<JoinAuthorizer>,
     _mcp_handle: Option<McpServerHandle>,
     _mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
     first_ready_tx: Option<oneshot::Sender<()>>,
-    _controller_ctx: Arc<ControllerActionContext>,
+    controller_ctx: Arc<ControllerActionContext>,
     _fast_path_state_channel: Arc<FastPathStateChannel>,
-    _unified_manager: UnifiedManagerHandle,
+    unified_manager: UnifiedManagerHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let passphrase = join_code.clone();
+        info!(
+            target = "beach::terminal::host",
+            session_id = %session_id,
+            passphrase_present = %passphrase.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false),
+            "starting webrtc acceptor (host offerer)"
+        );
+
+        let negotiated = negotiate_transport(
+            &session_handle,
+            passphrase.as_deref(),
+            Some("beach-host"),
+            false,
+            None,
+        )
+        .await;
+
+        let Ok(NegotiatedTransport::WebRtcOfferer { connection, .. }) = negotiated else {
+            warn!(
+                target = "beach::terminal::host",
+                session_id = %session_id,
+                error = ?negotiated.err(),
+                "webrtc offerer negotiation failed"
+            );
+            if let Some(tx) = first_ready_tx {
+                let _ = tx.send(());
+            }
+            return;
+        };
+
+        let transport = connection.transport();
+        let metadata = connection.metadata();
+        let shared = Arc::new(SharedTransport::new(transport.clone(), metadata));
+        {
+            let mut guard = transports.lock().unwrap();
+            guard.push(shared);
+        }
+        info!(
+            target = "beach::terminal::host",
+            session_id = %session_id,
+            transport_id = %transport.id().0,
+            kind = ?transport.kind(),
+            "webrtc offerer transport established"
+        );
+
+        // Bridge unified bus to buggy for controller actions/acks.
+        let bridge = Arc::new(UnifiedBuggyTransport::new(transport.clone()));
+        if let Err(err) = unified_manager.set_bridge(bridge.clone()) {
+            warn!(
+                target = "beach::terminal::host",
+                session_id = %session_id,
+                error = %err,
+                "failed to set unified bridge"
+            );
+        }
+        let _ = spawn_unified_action_consumer(controller_ctx, bridge, writer);
+
+        // Keep the transport warm with heartbeats to avoid idle timeouts.
+        HeartbeatPublisher::new(transport, None).spawn(Duration::from_secs(15), None);
+
         if let Some(tx) = first_ready_tx {
             let _ = tx.send(());
         }

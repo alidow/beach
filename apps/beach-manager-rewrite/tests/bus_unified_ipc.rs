@@ -27,7 +27,7 @@ async fn ipc_bus_to_persistence_round_trip() {
 
     // Give the bus a moment and drain to persistence.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    pipeline::drain_once(queue.clone(), persistence.clone(), 16).await;
+    pipeline::drain_once(queue.clone(), persistence.clone(), 16, None).await;
     let actions = persistence.actions().await;
     assert!(actions.iter().any(|a| a.id == "ipc-act"));
 }

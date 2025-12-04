@@ -20,20 +20,20 @@ services:
       - -lc
       - |
         export REDIS_URL=redis://beach-redis-smoke:6379
-        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-127.0.0.1}
+        export BEACH_ICE_PUBLIC_IP=${BEACH_ICE_PUBLIC_IP:-beach-road-smoke}
         exec /usr/local/cargo/bin/cargo run -p beach-road
     environment:
       REDIS_URL: redis://beach-redis-smoke:6379
-      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_PUBLIC_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_PUBLIC_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
       BEACH_ROAD_PORT: 14132
-      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-127.0.0.1}
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-beach-road-smoke}
       BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-65000}
       BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-65100}
       RUST_LOG: info,beach_road::heartbeat=debug,beach_road::webrtc=debug
     volumes:
-      - ../../..:/app
+      - ../../../../:/app
       - cargo-target-smoke:/app/target
       - cargo-registry-smoke:/usr/local/cargo/registry
     depends_on:
@@ -53,21 +53,32 @@ services:
       - |
         export REDIS_URL=redis://beach-redis-smoke:6379
         export BEACH_MANAGER_BUS_MODE=${BEACH_MANAGER_BUS_MODE:-rtc}
-        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
         export BEACH_MANAGER_REWRITE_ADDR=0.0.0.0:18081
+        export BEACH_WEBRTC_ATTACH_PASSPHRASE=${BEACH_WEBRTC_ATTACH_PASSPHRASE:-}
         exec /usr/local/cargo/bin/cargo run -p beach-manager-rewrite
     environment:
       REDIS_URL: redis://beach-redis-smoke:6379
       BEACH_MANAGER_BUS_MODE: ${BEACH_MANAGER_BUS_MODE:-rtc}
-      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
       BEACH_MANAGER_REWRITE_ADDR: 0.0.0.0:18081
       BEACH_MANAGER_INSTANCE_ID: beach-manager-rewrite-smoke
       BEACH_MANAGER_CAPACITY: 50
-      RUST_LOG: info,beach_manager_rewrite=debug
+      BEACH_TURN_DISABLE: "1"
+      BEACH_PUBLIC_MODE: "1"
+      # Disable NAT hinting inside bridge network; hostnames are not valid 1:1 hints.
+      BEACH_DISABLE_NAT_HINT: "1"
+      BEACH_ICE_PUBLIC_IP: beach-manager-rewrite-smoke
+      BEACH_ICE_PUBLIC_HOST: beach-manager-rewrite-smoke
+      BEACH_ICE_SERVERS: '[]'
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-20000}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-20050}
+      RUST_LOG: debug,beach_manager_rewrite=debug,transport_webrtc=debug,beach::transport::webrtc=debug
+      BEACH_WEBRTC_ATTACH_PASSPHRASE: ${BEACH_SMOKE_PASSPHRASE:-SMOKEP}
     volumes:
-      - ../../..:/app
+      - ../../../../:/app
       - cargo-target-smoke:/app/target
       - cargo-registry-smoke:/usr/local/cargo/registry
     depends_on:
@@ -85,19 +96,32 @@ services:
       - bash
       - -lc
       - |
-        export BEACH_SESSION_SERVER_BASE=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-        export BEACH_SESSION_SERVER=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+        export BEACH_SESSION_SERVER_BASE=${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+        export BEACH_SESSION_SERVER=${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+        export BEACH_ROAD_URL=${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
         export BEACH_MANAGER_BUS_MODE=rtc
+        export BEACH_HOST_PASSPHRASE=${BEACH_HOST_PASSPHRASE:-${BEACH_SMOKE_PASSPHRASE:-SMOKEP}}
         exec /usr/local/cargo/bin/cargo run -p beach
     environment:
-      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
-      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://api.beach.smoke:14132}
+      BEACH_SESSION_SERVER_BASE: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
+      BEACH_ROAD_URL: ${BEACH_SESSION_SERVER_BASE:-http://beach-road-smoke:14132}
       BEACH_MANAGER_BUS_MODE: rtc
-      RUST_LOG: info,beach=debug
+      BEACH_SMOKE_PASSPHRASE: ${BEACH_SMOKE_PASSPHRASE:-SMOKEP}
+      BEACH_HOST_PASSPHRASE: ${BEACH_SMOKE_PASSPHRASE:-SMOKEP}
+      BEACH_TURN_DISABLE: "1"
+      BEACH_PUBLIC_MODE: "1"
+      # Disable NAT hinting inside bridge network; hostnames are not valid 1:1 hints.
+      BEACH_DISABLE_NAT_HINT: "1"
+      BEACH_ICE_PUBLIC_IP: beach-host-smoke
+      BEACH_ICE_PUBLIC_HOST: beach-host-smoke
+      BEACH_ICE_SERVERS: '[]'
+      BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-20000}
+      BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-20050}
+      BEACH_LOG_LEVEL: debug
+      RUST_LOG: debug,beach=debug,transport_webrtc=debug,beach::transport::webrtc=debug
     volumes:
-      - ../../..:/app
+      - ../../../../:/app
       - cargo-target-smoke:/app/target
       - cargo-registry-smoke:/usr/local/cargo/registry
     depends_on:

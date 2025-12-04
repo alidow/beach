@@ -34,6 +34,7 @@ async fn main() {
         persistence,
         cfg.queue_batch_size,
         cfg.queue_drain_interval_ms,
+        Some(app_state.snapshot()),
     );
 
     let app: Router = routes::router(app_state);

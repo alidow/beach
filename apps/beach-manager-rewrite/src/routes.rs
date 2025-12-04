@@ -9,10 +9,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::metrics;
+use crate::routes::cache::cache_routes;
 use crate::state::AppState;
-use crate::routes::cache::cache_for_host;
 
 pub mod cache;
+
+#[derive(Serialize)]
+struct DebugAttachResponse {
+    started: bool,
+    error: Option<String>,
+}
 
 #[derive(Serialize)]
 struct ReadyResponse {
@@ -90,12 +96,16 @@ async fn attach(
                 "assignment decided"
             );
             if decision.assigned_here {
-                if let Err(err) = state.attach_bus_for_host(&body.host_session_id).await {
-                    warn!(
+                match state.attach_bus_for_host(&body.host_session_id).await {
+                    Ok(_) => info!(
+                        host_session_id = %body.host_session_id,
+                        "rtc bus attach requested and started for host"
+                    ),
+                    Err(err) => warn!(
                         host_session_id = %body.host_session_id,
                         error = %err,
                         "failed to attach rtc bus for host"
-                    );
+                    ),
                 }
             }
             (
@@ -161,7 +171,25 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/readyz", get(ready))
         .route("/attach", post(attach))
-        .route("/cache/:host_session_id", get(cache_for_host))
+        .route(
+            "/debug/attach-bus/:host_session_id",
+            post(
+                |State(state): State<AppState>,
+                 axum::extract::Path(host_session_id): axum::extract::Path<String>| async move {
+                    match state.attach_bus_for_host(&host_session_id).await {
+                        Ok(_) => Json(DebugAttachResponse {
+                            started: true,
+                            error: None,
+                        }),
+                        Err(err) => Json(DebugAttachResponse {
+                            started: false,
+                            error: Some(err.to_string()),
+                        }),
+                    }
+                },
+            ),
+        )
+        .merge(cache_routes())
         .with_state(state)
 }
 

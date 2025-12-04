@@ -153,7 +153,7 @@ mod tests {
         .unwrap();
         let _ = bus.publish("beach.manager.action", action_payload.into());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        pipeline::drain_once(queue.clone(), persistence.clone(), 16).await;
+        pipeline::drain_once(queue.clone(), persistence.clone(), 16, None).await;
         let actions = persistence.actions().await;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].id, "act-1");
@@ -170,7 +170,7 @@ mod tests {
         .unwrap();
         let _ = bus.publish("beach.manager.ack", ack_payload.into());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        pipeline::drain_once(queue.clone(), persistence.clone(), 16).await;
+        pipeline::drain_once(queue.clone(), persistence.clone(), 16, None).await;
         let leases = persistence.leases().await;
         assert!(leases.iter().any(|l| l.lease_id == "ack-1"));
 
@@ -197,6 +197,6 @@ mod tests {
         .unwrap();
         let _ = bus.publish("beach.manager.action", payload.into());
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        pipeline::drain_once(queue.clone(), persistence.clone(), 8).await;
+        pipeline::drain_once(queue.clone(), persistence.clone(), 8, None).await;
     }
 }
